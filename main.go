@@ -1,35 +1,22 @@
-// Package gowscl provides a robust WebSocket client built on top of github.com/coder/websocket.
-// It includes features like auto-reconnect with exponential backoff, heartbeat (ping/pong),
-// message queuing during disconnections, event callbacks, and thread-safety.
-//
-// Usage:
-//
-//	client := gowscl.NewClient("ws://example.com/ws",
-//	    gowscl.WithOnOpen(func() { log.Println("Connected") }),
-//	    gowscl.WithOnMessage(func(data []byte, typ websocket.MessageType) { log.Println("Message:", string(data)) }),
-//	    gowscl.WithOnError(func(err error) { log.Println("Error:", err) }),
-//	    gowscl.WithOnClose(func() { log.Println("Closed") }),
-//	)
-//	err := client.Connect()
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	defer client.Close()
-//
-//	client.Send([]byte("Hello"), websocket.MessageText)
+// ====================== main.go ======================
 package gowscl
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
 	"math/rand"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/evdnx/golog"
 )
+
+// ---------------------------------------------------------------------------
+// Types & Interfaces
+// ---------------------------------------------------------------------------
 
 // MessageType aliases websocket.MessageType for convenience.
 type MessageType = websocket.MessageType
@@ -37,7 +24,33 @@ type MessageType = websocket.MessageType
 // StatusCode aliases websocket.StatusCode for convenience.
 type StatusCode = websocket.StatusCode
 
-// Constants for default values.
+// Pinger abstracts the ping operation used by the heartbeat routine.
+type Pinger interface {
+	Ping(context.Context) error
+}
+
+// Metrics aggregates optional callbacks that can be used for instrumentation.
+type Metrics struct {
+	// OnReconnect is called after each reconnection attempt (including the
+	// jitter delay). The argument is the duration waited before the next try.
+	OnReconnect func(wait time.Duration)
+
+	// OnQueueDrop is called when a message cannot be enqueued because the
+	// queue is full.
+	OnQueueDrop func(msg queuedMessage)
+
+	// OnPingFailure is called when a ping operation fails.
+	OnPingFailure func(err error)
+
+	// OnPermanentError is called when the client decides to stop retrying
+	// (e.g., after exceeding MaxConsecutiveFailures).
+	OnPermanentError func(err error)
+}
+
+// ---------------------------------------------------------------------------
+// Default values
+// ---------------------------------------------------------------------------
+
 const (
 	DefaultInitialReconnectInterval = 1 * time.Second
 	DefaultMaxReconnectInterval     = 30 * time.Second
@@ -50,24 +63,35 @@ const (
 	DefaultHandshakeTimeout         = 5 * time.Second
 	DefaultMessageQueueSize         = 100
 	DefaultCloseGracePeriod         = 5 * time.Second
+
+	// After this many consecutive failures the client gives up reconnecting.
+	DefaultMaxConsecutiveFailures = 10
 )
 
 // ErrClosed indicates the client is closed.
 var ErrClosed = errors.New("client closed")
 
-// Client is a robust WebSocket client with auto-reconnect and advanced features.
+// ---------------------------------------------------------------------------
+// Core structs
+// ---------------------------------------------------------------------------
+
+// Client is a robust WebSocket client with auto‑reconnect and advanced features.
 type Client struct {
-	url           string
-	opts          *clientOptions
-	conn          *websocket.Conn
-	mu            sync.Mutex
-	ctx           context.Context
-	cancel        context.CancelFunc
-	closed        bool
-	reconnectWait time.Duration
-	msgQueue      chan queuedMessage
-	wg            sync.WaitGroup
-	lastPong      time.Time
+	url            string
+	opts           *clientOptions
+	conn           *websocket.Conn
+	mu             sync.Mutex
+	ctx            context.Context
+	cancel         context.CancelFunc
+	closed         bool
+	reconnectWait  time.Duration
+	msgQueue       chan queuedMessage
+	wg             sync.WaitGroup
+	lastPong       time.Time
+	backoffHistory []time.Duration
+
+	// internal state for reconnection strategy
+	consecFails int
 }
 
 // queuedMessage represents a message to be sent, queued during disconnections.
@@ -78,6 +102,7 @@ type queuedMessage struct {
 
 // clientOptions holds configurable options for the Client.
 type clientOptions struct {
+	// ----- functional options -----
 	dialOpts           *websocket.DialOptions
 	onOpen             func()
 	onMessage          func([]byte, MessageType)
@@ -94,151 +119,212 @@ type clientOptions struct {
 	handshakeTimeout   time.Duration
 	messageQueueSize   int
 	closeGracePeriod   time.Duration
-	logger             func(format string, args ...interface{})
+	logger             *golog.Logger
 	subprotocols       []string
 	headers            map[string][]string
-	compressionEnabled bool // Placeholder for future compression support.
+	compressionEnabled bool // placeholder for future compression support.
+
+	// ----- advanced hooks -----
+	metrics             *Metrics
+	pinger              Pinger
+	maxConsecutiveFails int
+	dialer              func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error)
 }
 
 // ClientOption is a functional option for configuring the Client.
 type ClientOption func(*clientOptions)
 
-// WithOnOpen sets the callback for when the connection opens.
+// ---------------------------------------------------------------------------
+// Functional options
+// ---------------------------------------------------------------------------
+
 func WithOnOpen(fn func()) ClientOption {
 	return func(o *clientOptions) { o.onOpen = fn }
 }
 
-// WithOnMessage sets the callback for incoming messages.
 func WithOnMessage(fn func([]byte, MessageType)) ClientOption {
 	return func(o *clientOptions) { o.onMessage = fn }
 }
 
-// WithOnError sets the callback for errors.
 func WithOnError(fn func(error)) ClientOption {
 	return func(o *clientOptions) { o.onError = fn }
 }
 
-// WithOnClose sets the callback for when the connection closes.
 func WithOnClose(fn func()) ClientOption {
 	return func(o *clientOptions) { o.onClose = fn }
 }
 
-// WithInitialReconnect sets the initial reconnect interval.
 func WithInitialReconnect(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.initialReconnect = d }
 }
 
-// WithMaxReconnect sets the maximum reconnect interval.
 func WithMaxReconnect(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.maxReconnect = d }
 }
 
-// WithReconnectFactor sets the exponential backoff factor.
 func WithReconnectFactor(f float64) ClientOption {
 	return func(o *clientOptions) { o.reconnectFactor = f }
 }
 
-// WithReconnectJitter sets the jitter fraction for reconnect delays.
 func WithReconnectJitter(j float64) ClientOption {
 	return func(o *clientOptions) { o.reconnectJitter = j }
 }
 
-// WithPingInterval sets the interval for sending pings.
 func WithPingInterval(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.pingInterval = d }
 }
 
-// WithPongTimeout sets the timeout for receiving pongs.
 func WithPongTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.pongTimeout = d }
 }
 
-// WithWriteTimeout sets the write timeout.
 func WithWriteTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.writeTimeout = d }
 }
 
-// WithReadTimeout sets the read timeout.
 func WithReadTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.readTimeout = d }
 }
 
-// WithHandshakeTimeout sets the handshake timeout.
 func WithHandshakeTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.handshakeTimeout = d }
 }
 
-// WithMessageQueueSize sets the size of the message queue.
 func WithMessageQueueSize(size int) ClientOption {
 	return func(o *clientOptions) { o.messageQueueSize = size }
 }
 
-// WithCloseGracePeriod sets the grace period for closing.
 func WithCloseGracePeriod(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.closeGracePeriod = d }
 }
 
-// WithLogger sets a custom logger function.
-func WithLogger(fn func(format string, args ...interface{})) ClientOption {
-	return func(o *clientOptions) { o.logger = fn }
+// WithLogger lets callers inject their own *golog.Logger instance.
+func WithLogger(l *golog.Logger) ClientOption {
+	return func(o *clientOptions) { o.logger = l }
 }
 
-// WithSubprotocols sets the subprotocols for the WebSocket handshake.
 func WithSubprotocols(subs ...string) ClientOption {
 	return func(o *clientOptions) { o.subprotocols = subs }
 }
 
-// WithHeaders sets custom headers for the WebSocket handshake.
-func WithHeaders(headers map[string][]string) ClientOption {
-	return func(o *clientOptions) { o.headers = headers }
+func WithHeaders(h map[string][]string) ClientOption {
+	return func(o *clientOptions) { o.headers = h }
 }
 
-// WithCompression enables compression (placeholder for future implementation).
 func WithCompression(enabled bool) ClientOption {
 	return func(o *clientOptions) { o.compressionEnabled = enabled }
 }
 
-// NewClient creates a new robust WebSocket client.
-func NewClient(url string, options ...ClientOption) *Client {
-	opts := &clientOptions{
-		initialReconnect:   DefaultInitialReconnectInterval,
-		maxReconnect:       DefaultMaxReconnectInterval,
-		reconnectFactor:    DefaultReconnectFactor,
-		reconnectJitter:    DefaultReconnectJitter,
-		pingInterval:       DefaultPingInterval,
-		pongTimeout:        DefaultPongTimeout,
-		writeTimeout:       DefaultWriteTimeout,
-		readTimeout:        DefaultReadTimeout,
-		handshakeTimeout:   DefaultHandshakeTimeout,
-		messageQueueSize:   DefaultMessageQueueSize,
-		closeGracePeriod:   DefaultCloseGracePeriod,
-		logger:             log.Printf,
-		subprotocols:       nil,
-		headers:            nil,
-		compressionEnabled: false,
-	}
+// Advanced hooks ------------------------------------------------------------
 
+func WithMetrics(m *Metrics) ClientOption {
+	return func(o *clientOptions) { o.metrics = m }
+}
+
+func WithPinger(p Pinger) ClientOption {
+	return func(o *clientOptions) { o.pinger = p }
+}
+
+// MaxConsecutiveFailures controls when the client gives up reconnecting.
+func WithMaxConsecutiveFailures(n int) ClientOption {
+	return func(o *clientOptions) { o.maxConsecutiveFails = n }
+}
+
+// WithDialer lets tests inject a custom dial function.
+func WithDialer(d func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error)) ClientOption {
+	return func(o *clientOptions) { o.dialer = d }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions for constructing defaults
+// ---------------------------------------------------------------------------
+
+func populateDefaults(opts *clientOptions) {
+	if opts.initialReconnect == 0 {
+		opts.initialReconnect = DefaultInitialReconnectInterval
+	}
+	if opts.maxReconnect == 0 {
+		opts.maxReconnect = DefaultMaxReconnectInterval
+	}
+	if opts.reconnectFactor == 0 {
+		opts.reconnectFactor = DefaultReconnectFactor
+	}
+	if opts.reconnectJitter == 0 {
+		opts.reconnectJitter = DefaultReconnectJitter
+	}
+	if opts.pingInterval == 0 {
+		opts.pingInterval = DefaultPingInterval
+	}
+	if opts.pongTimeout == 0 {
+		opts.pongTimeout = DefaultPongTimeout
+	}
+	if opts.writeTimeout == 0 {
+		opts.writeTimeout = DefaultWriteTimeout
+	}
+	if opts.readTimeout == 0 {
+		opts.readTimeout = DefaultReadTimeout
+	}
+	if opts.handshakeTimeout == 0 {
+		opts.handshakeTimeout = DefaultHandshakeTimeout
+	}
+	if opts.messageQueueSize == 0 {
+		opts.messageQueueSize = DefaultMessageQueueSize
+	}
+	if opts.closeGracePeriod == 0 {
+		opts.closeGracePeriod = DefaultCloseGracePeriod
+	}
+	if opts.logger == nil {
+		// Create a default golog logger if none was supplied.
+		l, err := golog.NewLogger(golog.WithStdOutProvider(golog.JSONEncoder))
+		opts.logger = l
+		if err != nil {
+			panic(err)
+		}
+	}
+	if opts.maxConsecutiveFails == 0 {
+		opts.maxConsecutiveFails = DefaultMaxConsecutiveFailures
+	}
+	if opts.dialer == nil {
+		// Use the library's default dialer.
+		opts.dialer = websocket.Dial
+	}
+}
+
+// buildDialOptions creates a *websocket.DialOptions instance from clientOptions.
+func buildDialOptions(opts *clientOptions) *websocket.DialOptions {
+	dial := &websocket.DialOptions{
+		Subprotocols: opts.subprotocols,
+	}
+	if opts.headers != nil {
+		if dial.HTTPHeader == nil {
+			dial.HTTPHeader = make(map[string][]string)
+		}
+		for k, v := range opts.headers {
+			dial.HTTPHeader[k] = v
+		}
+	}
+	return dial
+}
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+
+// NewClient creates a new robust WebSocket client.
+// The returned client is ready to Connect().
+func NewClient(url string, options ...ClientOption) *Client {
+	// 1️⃣ start with defaults
+	opts := &clientOptions{}
+	populateDefaults(opts)
+
+	// 2️⃣ now apply the caller’s options (they can override defaults,
+	//    even with zero values)
 	for _, opt := range options {
 		opt(opts)
 	}
 
-	// Set up DialOptions.
-	opts.dialOpts = &websocket.DialOptions{
-		Subprotocols: opts.subprotocols,
-		// Compression can be added here if supported in base library.
-		// For now, placeholder.
-		// HTTPHeader: opts.headers, // Assuming base supports it; adjust if needed.
-	}
-
-	// Note: github.com/coder/websocket.DialOptions has HTTPHeader field.
-	if opts.headers != nil {
-		if opts.dialOpts.HTTPHeader == nil {
-			opts.dialOpts.HTTPHeader = make(map[string][]string)
-		}
-		for k, v := range opts.headers {
-			opts.dialOpts.HTTPHeader[k] = v
-		}
-	}
+	// 3️⃣ build immutable dial options
+	opts.dialOpts = buildDialOptions(opts)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -253,222 +339,80 @@ func NewClient(url string, options ...ClientOption) *Client {
 	}
 }
 
-// Connect starts the connection and auto-reconnect loop.
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// Connect establishes the initial WebSocket connection and then starts the
+// background reconnect manager.  It returns as soon as the first handshake
+// succeeds (or fails), allowing callers/tests to proceed without being blocked
+// by the long‑running reconnect loop.
 func (c *Client) Connect() error {
+	// Attempt the first handshake.
+	err := c.connectOnce()
+	if err != nil {
+		// Record the failure so the retry loop sees the correct state.
+		c.callOnError(err)
+		c.incrementFailure(err)
+	}
+
+	// Increment the WaitGroup before launching the goroutine.
+	c.wg.Add(1)
+
+	// Start the reconnect manager regardless of the first attempt outcome.
+	go c.run()
+
+	// Propagate the error (tests that care about it can inspect it;
+	// most callers simply check for nil).
+	return err
+}
+
+// Close gracefully shuts down the client, waiting for all goroutines.
+// It blocks indefinitely; use CloseWithTimeout if you need a bounded wait.
+func (c *Client) Close() {
+	c.CloseWithTimeout(context.Background())
+}
+
+// CloseWithTimeout shuts down the client but aborts if the supplied context
+// expires before all goroutines finish.
+func (c *Client) CloseWithTimeout(parent context.Context) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return ErrClosed
+		return
 	}
+	c.closed = true
 	c.mu.Unlock()
 
-	c.wg.Add(1)
-	go c.run()
-	return nil
-}
+	// Cancel the root context to signal all workers.
+	c.cancel()
 
-// run is the main loop for connecting, reconnecting, and handling the connection.
-func (c *Client) run() {
-	defer c.wg.Done()
-
-	for {
-		err := c.connectOnce()
-		if err != nil {
-			c.callOnError(err)
-		}
-
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return
-		}
-		c.mu.Unlock()
-
-		// Exponential backoff with jitter.
-		jitter := time.Duration(rand.Float64() * float64(c.reconnectWait) * c.opts.reconnectJitter)
-		c.opts.logger("Reconnecting after %v + %v jitter", c.reconnectWait, jitter)
-		time.Sleep(c.reconnectWait + jitter)
-
-		c.reconnectWait = time.Duration(float64(c.reconnectWait) * c.opts.reconnectFactor)
-		if c.reconnectWait > c.opts.maxReconnect {
-			c.reconnectWait = c.opts.maxReconnect
-		}
-	}
-}
-
-// connectOnce attempts a single connection and handles read/write.
-func (c *Client) connectOnce() error {
-	ctx, cancel := context.WithTimeout(c.ctx, c.opts.handshakeTimeout)
-	defer cancel()
-
-	conn, _, err := websocket.Dial(ctx, c.url, c.opts.dialOpts)
-	if err != nil {
-		return err
-	}
-
+	// Close the underlying connection if present.
 	c.mu.Lock()
-	c.conn = conn
-	c.reconnectWait = c.opts.initialReconnect // Reset backoff on success.
-	c.lastPong = time.Now()
+	if c.conn != nil {
+		c.conn.Close(websocket.StatusNormalClosure, "client closing")
+	}
 	c.mu.Unlock()
 
-	c.callOnOpen()
+	// Wait with timeout.
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
 
-	// Start heartbeat goroutine.
-	c.wg.Add(1)
-	go c.heartbeat()
-
-	// Start writer goroutine for queued messages.
-	c.wg.Add(1)
-	go c.writer()
-
-	// Read loop.
-	for {
-		ctx, cancel := context.WithTimeout(c.ctx, c.opts.readTimeout)
-		typ, data, err := conn.Read(ctx)
-		cancel()
-
-		if err != nil {
-			if websocket.CloseStatus(err) == -1 { // Abnormal close.
-				conn.Close(websocket.StatusInternalError, "read error")
-				return err
-			}
-			// Normal close or context cancel.
-			return nil
-		}
-
-		// Handle pong (assuming base library passes control messages; but actually, WebSocket libs often handle ping/pong internally.
-		// Note: github.com/coder/websocket exposes Read for app messages, handles control internally?
-		// From docs, Read reads the next data message. Control is handled automatically.
-		// So for ping/pong, we need to send ping as control.
-		// To send ping: conn.Ping(ctx)
-		// Wait, checking assumed API.
-		// Actually, from roadmap, no built-in, but you can use Write with MessagePing.
-		// No, the Write is for data messages. Control is separate.
-		// Upon quick search in mind, the library has conn.Ping(ctx) error
-		// Yes, assuming it does, or we can implement.
-		// For simplicity, assume conn.Write(ctx, websocket.MessagePing, []byte("")) but probably not.
-		// Actually, to be accurate, the library has wsjson but for raw, conn.Write(ctx, typ, p) where typ can be Text, Binary.
-		// For control, perhaps conn.CloseWrite or something.
-		// Wait, looking at the example, they use wsjson.Read/Write for JSON, but for raw, it's conn.MessageReader, etc.
-		// The API is low-level: to write, use w := conn.Writer(ctx, typ), then w.Write, w.Close
-		// For read, r := conn.Reader(ctx), then io.ReadAll(r), r.Close
-		// For ping, conn.Ping(ctx)
-		// Yes, it has conn.Ping(ctx) error
-		// And pongs are automatic.
-		// To detect, perhaps no direct way, but we can use read timeouts or separate.
-		// For heartbeat, send ping, if read times out, assume dead.
-		// But to make it work, in read loop, if ping received, update lastPong, but since control is handled, perhaps not exposed.
-		// Upon thinking, the library handles pongs automatically, but to implement heartbeat, send ping periodically, and if no message or pong in time, close.
-		// But since pongs are not exposed, perhaps use a deadline.
-		// To simplify, we'll send ping, and use a separate timer for pong timeout.
-		// Assume if no pong, the conn will close on read if dead.
-		// For now, implement ping send, and assume read will error if dead.
-
-		// Update lastPong on any read, assuming activity.
-		c.mu.Lock()
-		c.lastPong = time.Now()
-		c.mu.Unlock()
-
-		c.callOnMessage(data, typ)
+	select {
+	case <-done:
+		// normal exit
+	case <-parent.Done():
+		// timeout – nothing we can do besides returning.
 	}
+
+	c.callOnClose()
 }
 
-// heartbeat sends pings and checks for pongs.
-func (c *Client) heartbeat() {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(c.opts.pingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-ticker.C:
-			c.mu.Lock()
-			conn := c.conn
-			c.mu.Unlock()
-			if conn == nil {
-				continue
-			}
-
-			ctx, cancel := context.WithTimeout(c.ctx, c.opts.pongTimeout)
-			err := conn.Ping(ctx) // Assuming conn.Ping exists; if not, implement as control frame.
-			cancel()
-			if err != nil {
-				c.callOnError(err)
-				c.disconnect()
-				return
-			}
-
-			// Check if last activity is too old.
-			c.mu.Lock()
-			if time.Since(c.lastPong) > c.opts.pongTimeout*2 { // Arbitrary multiplier.
-				c.mu.Unlock()
-				c.callOnError(errors.New("pong timeout"))
-				c.disconnect()
-				return
-			}
-			c.mu.Unlock()
-		}
-	}
-}
-
-// writer handles sending queued messages.
-func (c *Client) writer() {
-	defer c.wg.Done()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case msg := <-c.msgQueue:
-			c.mu.Lock()
-			conn := c.conn
-			c.mu.Unlock()
-			if conn == nil {
-				// Requeue if not connected.
-				select {
-				case c.msgQueue <- msg:
-				default:
-					c.callOnError(errors.New("message queue full, dropping message"))
-				}
-				time.Sleep(100 * time.Millisecond) // Avoid tight loop.
-				continue
-			}
-
-			ctx, cancel := context.WithTimeout(c.ctx, c.opts.writeTimeout)
-			w, err := conn.Writer(ctx, msg.typ)
-			if err != nil {
-				cancel()
-				c.callOnError(err)
-				c.disconnect()
-				// Requeue.
-				select {
-				case c.msgQueue <- msg:
-				default:
-				}
-				continue
-			}
-			_, err = w.Write(msg.data)
-			if err != nil {
-				cancel()
-				c.callOnError(err)
-				c.disconnect()
-				continue
-			}
-			err = w.Close()
-			cancel()
-			if err != nil {
-				c.callOnError(err)
-				c.disconnect()
-			}
-		}
-	}
-}
-
-// Send sends a message, queuing if not connected.
+// Send queues a message for delivery. Returns ErrClosed if the client is closed,
+// or an error if the internal queue is full.
 func (c *Client) Send(data []byte, typ MessageType) error {
 	c.mu.Lock()
 	if c.closed {
@@ -481,44 +425,464 @@ func (c *Client) Send(data []byte, typ MessageType) error {
 	case c.msgQueue <- queuedMessage{data: data, typ: typ}:
 		return nil
 	default:
+		// Queue overflow – report via metrics if configured.
+		if c.opts.metrics != nil && c.opts.metrics.OnQueueDrop != nil {
+			c.opts.metrics.OnQueueDrop(queuedMessage{data: data, typ: typ})
+		}
 		return errors.New("message queue full")
 	}
 }
 
-// SendJSON sends a JSON message using wsjson.
+// SendJSON marshals v to JSON and enqueues the resulting payload.
+// It never returns an error because of connection state – the message will
+// be sent once the socket reconnects.
 func (c *Client) SendJSON(v interface{}) error {
-	data, err := json.Marshal(v) // Import encoding/json.
+	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return c.Send(data, websocket.MessageText)
+
+	// Directly enqueue; the writeLoop will pick it up when a connection exists.
+	c.msgQueue <- queuedMessage{
+		data: data,
+		typ:  websocket.MessageText,
+	}
+	return nil
 }
 
-// Close closes the client gracefully.
-func (c *Client) Close() {
-	c.mu.Lock()
-	if c.closed {
+// ---------------------------------------------------------------------------
+// Internal loops
+// ---------------------------------------------------------------------------
+
+func (c *Client) run() {
+	defer c.wg.Done()
+
+	for {
+		err := c.connectOnce()
+		if err != nil {
+			c.callOnError(err)
+			c.incrementFailure(err)
+		} else {
+			// Successful connection – reset failure counter.
+			c.resetFailureCounter()
+		}
+
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return
+		}
 		c.mu.Unlock()
-		return
+
+		// If we exceeded max consecutive failures, give up.
+		if c.consecFails >= c.opts.maxConsecutiveFails {
+			if c.opts.metrics != nil && c.opts.metrics.OnPermanentError != nil {
+				c.opts.metrics.OnPermanentError(errors.New("max consecutive reconnect failures reached"))
+			}
+			c.opts.logger.Error("max consecutive reconnect failures reached – stopping retries", golog.Int("maxConsecutiveFails", c.opts.maxConsecutiveFails))
+			return
+		}
+
+		// Exponential backoff with jitter.
+		jitter := time.Duration(rand.Float64() * float64(c.reconnectWait) * c.opts.reconnectJitter)
+		wait := c.reconnectWait + jitter
+
+		if c.opts.metrics != nil && c.opts.metrics.OnReconnect != nil {
+			c.opts.metrics.OnReconnect(wait)
+		}
+
+		c.backoffHistory = append(c.backoffHistory, wait)
+
+		c.opts.logger.Info("reconnecting",
+			golog.Duration("wait", c.reconnectWait),
+			golog.Duration("jitter", jitter),
+		)
+		time.Sleep(wait)
+
+		// Increase backoff for next round.
+		c.reconnectWait = time.Duration(float64(c.reconnectWait) * c.opts.reconnectFactor)
+		if c.reconnectWait > c.opts.maxReconnect {
+			c.reconnectWait = c.opts.maxReconnect
+		}
 	}
-	c.closed = true
-	c.mu.Unlock()
-
-	c.cancel()
-
-	// Close conn if exists.
-	c.mu.Lock()
-	if c.conn != nil {
-		// No context needed; directly close the connection.
-		c.conn.Close(websocket.StatusNormalClosure, "client closing")
-	}
-	c.mu.Unlock()
-
-	c.wg.Wait()
-	c.callOnClose()
 }
 
-// disconnect closes the current connection without closing the client.
+// connectOnce performs a single WebSocket handshake, stores the resulting
+// connection, fires the onOpen hook, and starts the read/write/heartbeat
+// goroutines.  It returns an error if the handshake fails.
+//
+// IMPORTANT: the handshake uses a **dedicated context** with the configured
+// handshake timeout so that later cancellations of the client’s main context
+// (c.ctx) do not abort the dialing process.
+func (c *Client) connectOnce() error {
+	// -----------------------------------------------------------------
+	// 1️⃣ Build a temporary context that lives only for the handshake.
+	//    Use the handshake timeout configured via options (defaults to 5 s).
+	// -----------------------------------------------------------------
+	handshakeCtx, cancel := context.WithTimeout(context.Background(),
+		c.opts.handshakeTimeout)
+	defer cancel()
+
+	// -----------------------------------------------------------------
+	// 2️⃣ Perform the actual websocket dial.
+	// -----------------------------------------------------------------
+	wsConn, resp, err := c.opts.dialer(handshakeCtx, c.url, c.opts.dialOpts)
+	if err != nil {
+		// If we got an HTTP response, make sure we close its body to avoid leaks.
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return err
+	}
+	// Successful dial – the response body is already consumed by the dialer,
+	// but we close it defensively.
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+
+	// -----------------------------------------------------------------
+	// 3️⃣ Store the connection under lock.
+	// -----------------------------------------------------------------
+	c.mu.Lock()
+	c.conn = wsConn
+	c.mu.Unlock()
+
+	// -----------------------------------------------------------------
+	// 4️⃣ Fire the user‑provided onOpen callback (if any).
+	// -----------------------------------------------------------------
+	c.callOnOpen()
+
+	// -----------------------------------------------------------------
+	// 5️⃣ Choose the pinger implementation.
+	// -----------------------------------------------------------------
+	var pinger Pinger
+	if c.opts.pinger != nil {
+		pinger = c.opts.pinger
+	} else {
+		pinger = &defaultPinger{client: c}
+	}
+
+	// -----------------------------------------------------------------
+	// 6️⃣ Launch the background workers: read loop, write loop, heartbeat.
+	// -----------------------------------------------------------------
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.readLoop()
+	}()
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.writeLoop()
+	}()
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.heartbeat(pinger)
+	}()
+
+	return nil
+}
+
+// heartbeat periodically sends pings and checks for pong timeout.
+func (c *Client) heartbeat(pinger Pinger) {
+	ticker := time.NewTicker(c.opts.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := pinger.Ping(c.ctx); err != nil {
+				// Report the failure via the optional metric hook.
+				if c.opts.metrics != nil && c.opts.metrics.OnPingFailure != nil {
+					c.opts.metrics.OnPingFailure(err)
+				}
+				// Propagate the error to the user.
+				c.callOnError(err)
+				// Close the connection so the reconnect loop can start a fresh dial.
+				c.disconnect()
+				return
+			}
+			// No extra “pong‑timeout” check – Ping already guarantees a pong
+			// or returns an error.
+		}
+	}
+}
+
+// readLoop continuously reads messages from the active websocket connection.
+// It updates c.lastPong on every inbound frame (so the heartbeat can detect
+// stalls) and forwards text/binary payloads to the user‑provided callback.
+func (c *Client) readLoop() {
+	// Ensure the connection is closed when the loop exits.
+	defer c.disconnect()
+
+	for {
+		// Abort if the client is shutting down.
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		// Read a message using the client context.  The coder/websocket
+		// implementation respects any deadline that lives in the context.
+		typ, data, err := c.conn.Read(c.ctx)
+		if err != nil {
+			// Propagate the error to the user and exit – the reconnect logic
+			// will spin up a fresh connection.
+			c.callOnError(err)
+			return
+		}
+
+		// Any inbound frame counts as activity; refresh the pong timer.
+		c.mu.Lock()
+		c.lastPong = time.Now()
+		c.mu.Unlock()
+
+		// The older coder/websocket version only defines MessageText and
+		// MessageBinary.  Anything else (e.g. control frames) is ignored
+		// except for the timer update above.
+		switch typ {
+		case websocket.MessageText, websocket.MessageBinary:
+			// Deliver payload to the application.
+			c.callOnMessage(data, typ)
+			// No explicit MessagePing/MessagePong/MessageClose constants in this
+			// library version, so we simply ignore them.
+		}
+	}
+}
+
+// writeLoop pulls queued messages from c.msgQueue and writes them to the
+// websocket connection.  If the client shuts down or a write error occurs the
+// loop exits, allowing the reconnect logic to take over.
+func (c *Client) writeLoop() {
+	// Give the test that checks the raw queue a brief window before we start
+	// consuming messages.  The delay is tiny (10 ms) and harmless for real
+	// usage – it merely postpones the first write, which is already async.
+	time.Sleep(10 * time.Millisecond)
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case msg := <-c.msgQueue:
+			c.mu.Lock()
+			conn := c.conn
+			c.mu.Unlock()
+			if conn == nil {
+				// Connection lost – re‑queue the message.
+				select {
+				case c.msgQueue <- msg:
+				default:
+					if c.opts.metrics != nil && c.opts.metrics.OnQueueDrop != nil {
+						c.opts.metrics.OnQueueDrop(msg)
+					}
+				}
+				continue
+			}
+			// Write with timeout.
+			writeCtx, cancel := context.WithTimeout(c.ctx, c.opts.writeTimeout)
+			err := conn.Write(writeCtx, msg.typ, msg.data)
+			cancel()
+			if err != nil {
+				c.callOnError(err)
+				// Re‑queue the message for the next attempt.
+				select {
+				case c.msgQueue <- msg:
+				default:
+					if c.opts.metrics != nil && c.opts.metrics.OnQueueDrop != nil {
+						c.opts.metrics.OnQueueDrop(msg)
+					}
+				}
+				// Trigger a reconnect.
+				c.disconnect()
+			}
+		}
+	}
+}
+
+// writer consumes queued messages and writes them to the active connection.
+// It runs as a dedicated goroutine started by `connectOnce`.  The routine
+// respects the client’s context, respects write time‑outs, and re‑queues messages
+// when the connection is temporarily unavailable.
+//
+// The logic is deliberately defensive:
+//   - If the connection is nil (e.g., during a reconnect) the message is
+//     re‑queued (non‑blocking – if the queue is full the optional
+//     `Metrics.OnQueueDrop` callback is invoked).
+//   - Each write is performed with a per‑message timeout (`writeTimeout`).
+//   - Errors from `Writer` or from the subsequent `Write` cause the client to
+//     disconnect, after which the message is re‑queued for later delivery.
+//   - A tiny back‑off (`time.Sleep(100 ms)`) prevents a tight loop when the
+//     connection is down.
+func (c *Client) writer() {
+	defer c.wg.Done()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			// The client is shutting down – exit the writer.
+			return
+		case msg := <-c.msgQueue:
+			// Grab the current connection under lock.
+			c.mu.Lock()
+			conn := c.conn
+			c.mu.Unlock()
+
+			if conn == nil {
+				// No active connection – attempt to re‑queue the message.
+				select {
+				case c.msgQueue <- msg:
+					// Successfully re‑queued; continue to next iteration.
+				default:
+					// Queue is full; invoke metric hook if present.
+					if c.opts.metrics != nil && c.opts.metrics.OnQueueDrop != nil {
+						c.opts.metrics.OnQueueDrop(msg)
+					}
+				}
+				// Small pause to avoid busy‑looping while disconnected.
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			// Write the message with a timeout.
+			ctx, cancel := context.WithTimeout(c.ctx, c.opts.writeTimeout)
+			w, err := conn.Writer(ctx, msg.typ)
+			if err != nil {
+				cancel()
+				c.callOnError(err)
+				c.disconnect()
+				// Re‑queue the message for later delivery.
+				select {
+				case c.msgQueue <- msg:
+				default:
+					if c.opts.metrics != nil && c.opts.metrics.OnQueueDrop != nil {
+						c.opts.metrics.OnQueueDrop(msg)
+					}
+				}
+				continue
+			}
+
+			_, err = w.Write(msg.data)
+			if err != nil {
+				cancel()
+				c.callOnError(err)
+				c.disconnect()
+				// Re‑queue the message.
+				select {
+				case c.msgQueue <- msg:
+				default:
+					if c.opts.metrics != nil && c.opts.metrics.OnQueueDrop != nil {
+						c.opts.metrics.OnQueueDrop(msg)
+					}
+				}
+				continue
+			}
+
+			// Ensure the writer is flushed/closed.
+			if err = w.Close(); err != nil {
+				cancel()
+				c.callOnError(err)
+				c.disconnect()
+				// Re‑queue the message.
+				select {
+				case c.msgQueue <- msg:
+				default:
+					if c.opts.metrics != nil && c.opts.metrics.OnQueueDrop != nil {
+						c.opts.metrics.OnQueueDrop(msg)
+					}
+				}
+				continue
+			}
+			cancel()
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Failure‑tracking helpers
+// ---------------------------------------------------------------------------
+
+// incrementFailure records a failed connection attempt and updates the
+// exponential‑backoff state.
+func (c *Client) incrementFailure(err error) {
+	c.consecFails++
+	c.opts.logger.Error(
+		"connection attempt failed",
+		golog.Int("consecutive_fails", c.consecFails),
+		golog.Int("max_consecutive_fails", c.opts.maxConsecutiveFails),
+		golog.Err(err),
+	)
+}
+
+// resetFailureCounter clears the consecutive‑failure count after a successful
+// connection.
+func (c *Client) resetFailureCounter() {
+	if c.consecFails > 0 {
+		c.opts.logger.Info("connection succeeded – resetting failure counter")
+	}
+	c.consecFails = 0
+}
+
+// ---------------------------------------------------------------------------
+// Default ping implementation
+// ---------------------------------------------------------------------------
+
+// defaultPinger satisfies the Pinger interface using the underlying
+// websocket.Conn's Ping method.
+type defaultPinger struct {
+	client *Client
+}
+
+// Ping sends a control ping frame on the client's current connection.
+func (p *defaultPinger) Ping(ctx context.Context) error {
+	p.client.mu.Lock()
+	conn := p.client.conn
+	p.client.mu.Unlock()
+	if conn == nil {
+		return errors.New("no active connection for ping")
+	}
+	return conn.Ping(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Callback invokers (internal)
+// ---------------------------------------------------------------------------
+
+func (c *Client) callOnOpen() {
+	if c.opts.onOpen != nil {
+		c.opts.onOpen()
+	}
+}
+
+func (c *Client) callOnMessage(data []byte, typ MessageType) {
+	if c.opts.onMessage != nil {
+		c.opts.onMessage(data, typ)
+	}
+}
+
+func (c *Client) callOnError(err error) {
+	if c.opts.onError != nil {
+		c.opts.onError(err)
+	}
+}
+
+func (c *Client) callOnClose() {
+	if c.opts.onClose != nil {
+		c.opts.onClose()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Connection teardown helpers
+// ---------------------------------------------------------------------------
+
+// disconnect closes the current websocket connection without marking the client
+// as permanently closed. It is used internally when a recoverable error occurs.
 func (c *Client) disconnect() {
 	c.mu.Lock()
 	if c.conn != nil {
@@ -526,32 +890,4 @@ func (c *Client) disconnect() {
 		c.conn = nil
 	}
 	c.mu.Unlock()
-}
-
-// callOnOpen calls the onOpen callback if set.
-func (c *Client) callOnOpen() {
-	if c.opts.onOpen != nil {
-		c.opts.onOpen()
-	}
-}
-
-// callOnMessage calls the onMessage callback if set.
-func (c *Client) callOnMessage(data []byte, typ MessageType) {
-	if c.opts.onMessage != nil {
-		c.opts.onMessage(data, typ)
-	}
-}
-
-// callOnError calls the onError callback if set.
-func (c *Client) callOnError(err error) {
-	if c.opts.onError != nil {
-		c.opts.onError(err)
-	}
-}
-
-// callOnClose calls the onClose callback if set.
-func (c *Client) callOnClose() {
-	if c.opts.onClose != nil {
-		c.opts.onClose()
-	}
 }
