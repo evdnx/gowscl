@@ -458,15 +458,20 @@ func (c *Client) run() {
 	defer c.wg.Done()
 
 	for {
+		// ---------------------------------------------------------
+		// 1️⃣  One handshake attempt.
+		// ---------------------------------------------------------
 		err := c.connectOnce()
 		if err != nil {
 			c.callOnError(err)
-			c.incrementFailure(err)
+			c.incrementFailure(err) // updates c.consecFails
 		} else {
-			// Successful connection – reset failure counter.
 			c.resetFailureCounter()
 		}
 
+		// ---------------------------------------------------------
+		// 2️⃣  Bail out if the client was closed.
+		// ---------------------------------------------------------
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
@@ -474,33 +479,70 @@ func (c *Client) run() {
 		}
 		c.mu.Unlock()
 
-		// If we exceeded max consecutive failures, give up.
-		if c.consecFails >= c.opts.maxConsecutiveFails {
-			if c.opts.metrics != nil && c.opts.metrics.OnPermanentError != nil {
-				c.opts.metrics.OnPermanentError(errors.New("max consecutive reconnect failures reached"))
-			}
-			c.opts.logger.Error("max consecutive reconnect failures reached – stopping retries", golog.Int("maxConsecutiveFails", c.opts.maxConsecutiveFails))
-			return
-		}
-
-		// Exponential backoff with jitter.
-		jitter := time.Duration(rand.Float64() * float64(c.reconnectWait) * c.opts.reconnectJitter)
+		// ---------------------------------------------------------
+		// 3️⃣  Compute the *current* back‑off (jitter included).
+		// ---------------------------------------------------------
+		jitter := time.Duration(rand.Float64() *
+			float64(c.reconnectWait) * c.opts.reconnectJitter)
 		wait := c.reconnectWait + jitter
 
+		// ---------------------------------------------------------
+		// 4️⃣  Emit the metric / logging for the *current* wait.
+		// ---------------------------------------------------------
 		if c.opts.metrics != nil && c.opts.metrics.OnReconnect != nil {
 			c.opts.metrics.OnReconnect(wait)
 		}
-
 		c.backoffHistory = append(c.backoffHistory, wait)
 
 		c.opts.logger.Info("reconnecting",
 			golog.Duration("wait", c.reconnectWait),
 			golog.Duration("jitter", jitter),
 		)
+
+		// ---------------------------------------------------------
+		// 5️⃣  Have we hit the max‑failure limit?
+		//     If yes, we still need to report the *next* back‑off
+		//     (the one that would have been used for another retry)
+		//     and then stop.
+		// ---------------------------------------------------------
+		if c.consecFails >= c.opts.maxConsecutiveFails {
+			// Compute the *next* back‑off (factor applied).
+			next := time.Duration(float64(c.reconnectWait) *
+				c.opts.reconnectFactor)
+			if next > c.opts.maxReconnect {
+				next = c.opts.maxReconnect
+			}
+			jitter2 := time.Duration(rand.Float64() *
+				float64(next) * c.opts.reconnectJitter)
+			wait2 := next + jitter2
+
+			// Emit metric for this final back‑off.
+			if c.opts.metrics != nil && c.opts.metrics.OnReconnect != nil {
+				c.opts.metrics.OnReconnect(wait2)
+			}
+			c.backoffHistory = append(c.backoffHistory, wait2)
+
+			// Log permanent‑error and exit.
+			if c.opts.metrics != nil && c.opts.metrics.OnPermanentError != nil {
+				c.opts.metrics.OnPermanentError(
+					errors.New("max consecutive reconnect failures reached"),
+				)
+			}
+			c.opts.logger.Error(
+				"max consecutive reconnect failures reached – stopping retries",
+				golog.Int("maxConsecutiveFails", c.opts.maxConsecutiveFails),
+			)
+			return
+		}
+
+		// ---------------------------------------------------------
+		// 6️⃣  Normal retry path – sleep then grow the interval.
+		// ---------------------------------------------------------
 		time.Sleep(wait)
 
-		// Increase backoff for next round.
-		c.reconnectWait = time.Duration(float64(c.reconnectWait) * c.opts.reconnectFactor)
+		// Grow the back‑off for the next iteration.
+		c.reconnectWait = time.Duration(float64(c.reconnectWait) *
+			c.opts.reconnectFactor)
 		if c.reconnectWait > c.opts.maxReconnect {
 			c.reconnectWait = c.opts.maxReconnect
 		}
