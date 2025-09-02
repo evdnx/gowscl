@@ -1,154 +1,148 @@
 # gowscl
 
-gowscl is a Go package built on top of [github.com/coder/websocket](https://github.com/coder/websocket), providing a robust WebSocket client with advanced features like auto-reconnection with exponential backoff, heartbeat (ping/pong), message queuing during disconnections, event callbacks, and thread-safety. It simplifies building reliable WebSocket applications in idiomatic Go.
+`gowscl` is a Go package built on top of **github.com/coder/websocket**, providing a robust WebSocket client with advanced features such as auto‑reconnection (exponential back‑off with jitter), heartbeat (ping/pong), message queuing during disconnections, event callbacks, and thread‑safety. It simplifies building reliable WebSocket applications in idiomatic Go.
 
 ## Features
 
-- **Auto-Reconnect**: Automatically reconnects with exponential backoff and configurable jitter to handle network interruptions gracefully.
-- **Heartbeat**: Sends periodic pings and monitors pongs to detect connection issues.
-- **Message Queuing**: Queues messages during disconnections and sends them once reconnected, preventing message loss.
-- **Event Callbacks**: Supports callbacks for connection open, message receipt, errors, and connection close.
-- **Thread-Safe**: Uses mutexes to ensure safe concurrent access.
-- **Configurable Options**: Customize reconnect intervals, timeouts, subprotocols, headers, and more.
-- **JSON Support**: Simplifies sending JSON messages with a dedicated `SendJSON` method.
-- **Graceful Shutdown**: Ensures clean closure of connections with a configurable grace period.
+- **Auto‑Reconnect** – Automatically reconnects with exponential back‑off, configurable jitter and a maximum‑failure limit.  
+- **Heartbeat** – Periodic pings with configurable interval and pong timeout; failures trigger reconnection.  
+- **Message Queuing** – Outgoing messages are queued while the connection is down and flushed once a new connection is established (queue size is configurable).  
+- **Event Callbacks** – Hooks for connection open, incoming messages, errors, and connection close.  
+- **Thread‑Safe** – All mutable state is protected by a mutex, allowing concurrent use of the client.  
+- **Configurable Options** – Fine‑grained control over reconnect timings, timeouts, sub‑protocols, custom headers, logger, etc.  
+- **JSON Helper** – `SendJSON` marshals a value to JSON and enqueues it as a text frame.  
+- **Graceful Shutdown** – `Close` blocks until all goroutines finish; `CloseWithTimeout` lets you bound the wait time.
 
 ## Installation
-
-Install the package using:
-
 ```bash
-go get github.com/evdnx/gowscl
+    go get github.com/evdnx/gowscl
 ```
 
-*Note: Replace `github.com/evdnx/gowscl` with the actual repository path once published.*
-
-Ensure you have the dependency `github.com/coder/websocket` installed:
-
-```bash
-go get github.com/coder/websocket
-```
-
-## Usage
-
-Below is a basic example of using the gowscl client:
+## Quick Start
 
 ```go
 package main
 
 import (
 	"log"
+	"time"
+
 	"github.com/evdnx/gowscl"
 	"github.com/coder/websocket"
 )
 
 func main() {
-	client := gowscl.NewClient("ws://example.com/ws",
-		gowscl.WithOnOpen(func() { log.Println("Connected to WebSocket server") }),
+	client := gowscl.NewClient(
+		"ws://example.com/ws",
+		gowscl.WithOnOpen(func() { log.Println("Connected") }),
 		gowscl.WithOnMessage(func(data []byte, typ websocket.MessageType) {
-			log.Printf("Received message: %s (Type: %v)", string(data), typ)
+			log.Printf("← %s (type=%v)", string(data), typ)
 		}),
-		gowscl.WithOnError(func(err error) { log.Printf("Error: %v", err) }),
-		gowscl.WithOnClose(func() { log.Println("Connection closed") }),
+		gowscl.WithOnError(func(err error) { log.Printf("error: %v", err) }),
+		gowscl.WithOnClose(func() { log.Println("Closed") }),
+
+		// Example customizations
 		gowscl.WithInitialReconnect(2*time.Second),
 		gowscl.WithMaxReconnect(60*time.Second),
 		gowscl.WithPingInterval(15*time.Second),
 	)
 
-	err := client.Connect()
-	if err != nil {
-		log.Fatalf("Failed to connect: %v", err)
+	if err := client.Connect(); err != nil {
+		log.Fatalf("connect failed: %v", err)
 	}
 	defer client.Close()
 
-	// Send a text message
-	err = client.Send([]byte("Hello, WebSocket!"), websocket.MessageText)
-	if err != nil {
-		log.Printf("Failed to send message: %v", err)
+	// Send a plain‑text message
+	if err := client.Send([]byte("Hello, WebSocket!"), websocket.MessageText); err != nil {
+		log.Printf("send failed: %v", err)
 	}
 
-	// Send a JSON message
-	err = client.SendJSON(map[string]string{"message": "Hello, JSON!"})
-	if err != nil {
-		log.Printf("Failed to send JSON: %v", err)
+	// Send a JSON payload
+	if err := client.SendJSON(map[string]string{"msg": "Hello, JSON!"}); err != nil {
+		log.Printf("sendJSON failed: %v", err)
 	}
 
-	// Keep the program running
+	// Keep the program running (or do other work)
 	select {}
 }
 ```
 
 ## Configuration Options
 
-Customize the client using the following options:
+| Option | Description |
+|--------|-------------|
+| `WithOnOpen(func())` | Called when a connection is successfully opened. |
+| `WithOnMessage(func([]byte, websocket.MessageType))` | Called for each incoming text or binary frame. |
+| `WithOnError(func(error))` | Called whenever the client encounters an error (dial, read, write, ping, etc.). |
+| `WithOnClose(func())` | Called when the client is shut down. |
+| `WithInitialReconnect(time.Duration)` | First back‑off delay after a failed handshake (default = 1 s). |
+| `WithMaxReconnect(time.Duration)` | Upper bound for the back‑off delay (default = 30 s). |
+| `WithReconnectFactor(float64)` | Multiplicative factor for exponential growth (default = 2.0). |
+| `WithReconnectJitter(float64)` | Fraction of the current back‑off to add as random jitter (default = 0.5). |
+| `WithPingInterval(time.Duration)` | How often to send a ping frame (default = 30 s). |
+| `WithPongTimeout(time.Duration)` | Time allowed to receive a pong after a ping (default = 10 s). |
+| `WithWriteTimeout(time.Duration)` | Per‑message write deadline (default = 10 s). |
+| `WithReadTimeout(time.Duration)` | Read deadline for the underlying connection (default = 10 s). |
+| `WithHandshakeTimeout(time.Duration)` | Timeout for the initial WebSocket handshake (default = 5 s). |
+| `WithMessageQueueSize(int)` | Capacity of the outbound queue (default = 100). |
+| `WithCloseGracePeriod(time.Duration)` | Grace period before force‑closing the connection (default = 5 s). |
+| `WithLogger(*golog.Logger)` | Inject a custom logger; defaults to a JSON logger writing to stdout. |
+| `WithSubprotocols(...string)` | List of sub‑protocols advertised during the handshake. |
+| `WithHeaders(map[string][]string)` | Additional HTTP headers for the handshake. |
+| `WithCompression(bool)` | Placeholder for future compression support. |
+| `WithMetrics(*Metrics)` | Supply callbacks for instrumentation (reconnect, queue drops, ping failures, permanent errors). |
+| `WithPinger(Pinger)` | Override the default ping implementation. |
+| `WithMaxConsecutiveFailures(int)` | Stop retrying after this many consecutive failures (default = 10). |
+| `WithDialer(func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error))` | Inject a custom dial function (useful for tests). |
 
-- `WithOnOpen(func())`: Callback when the connection opens.
-- `WithOnMessage(func([]byte, websocket.MessageType))`: Callback for incoming messages.
-- `WithOnError(func(error))`: Callback for errors.
-- `WithOnClose(func())`: Callback when the connection closes.
-- `WithInitialReconnect(time.Duration)`: Initial delay before reconnect attempts (default: 1s).
-- `WithMaxReconnect(time.Duration)`: Maximum reconnect delay (default: 30s).
-- `WithReconnectFactor(float64)`: Exponential backoff factor (default: 2.0).
-- `WithReconnectJitter(float64)`: Random jitter fraction for reconnect delays (default: 0.5).
-- `WithPingInterval(time.Duration)`: Interval for sending pings (default: 30s).
-- `WithPongTimeout(time.Duration)`: Timeout for receiving pongs (default: 10s).
-- `WithWriteTimeout(time.Duration)`: Timeout for write operations (default: 10s).
-- `WithReadTimeout(time.Duration)`: Timeout for read operations (default: 10s).
-- `WithHandshakeTimeout(time.Duration)`: Timeout for WebSocket handshake (default: 5s).
-- `WithMessageQueueSize(int)`: Size of the message queue for disconnections (default: 100).
-- `WithCloseGracePeriod(time.Duration)`: Grace period for closing connections (default: 5s).
-- `WithLogger(func(string, ...interface{}))`: Custom logger function (default: `log.Printf`).
-- `WithSubprotocols(...string)`: Subprotocols for the WebSocket handshake.
-- `WithHeaders(map[string][]string)`: Custom headers for the WebSocket handshake.
-- `WithCompression(bool)`: Enable compression (placeholder for future support).
-
-Example with custom options:
+### Metrics Callbacks
 
 ```go
-client := gowscl.NewClient("ws://example.com/ws",
-	gowscl.WithInitialReconnect(5*time.Second),
-	gowscl.WithMaxReconnect(120*time.Second),
-	gowscl.WithSubprotocols("chat", "superchat"),
-	gowscl.WithHeaders(map[string][]string{
-		"Authorization": {"Bearer your-token"},
-	}),
-	gowscl.WithLogger(func(format string, args ...interface{}) {
-		log.Printf("[CUSTOM LOG] "+format, args...)
-	}),
-)
+type Metrics struct {
+    OnReconnect      func(wait time.Duration)          // each back‑off wait
+    OnQueueDrop      func(msg queuedMessage)           // when the queue overflows
+    OnPingFailure    func(err error)                   // ping returned an error
+    OnPermanentError func(err error)                   // client gave up reconnecting
+}
 ```
 
-## Notes
+## Internals Worth Knowing
 
-- **Ping/Pong Handling**: The client sends pings at the configured interval and monitors connection health. If no activity (pong or message) is detected within twice the pong timeout, the connection is considered dead and reconnection is attempted.
-- **Message Queuing**: Messages sent during disconnections are queued (up to the configured queue size) and sent upon reconnection.
-- **Compression**: Currently a placeholder; compression support depends on the underlying `github.com/coder/websocket` library. Check its roadmap for updates.
-- **Thread-Safety**: The client is safe for concurrent use, with internal mutexes protecting connection state and message queuing.
-- **Error Handling**: Errors during connection, read, write, or ping/pong are reported via the `OnError` callback, and the client attempts to reconnect automatically.
+- **Back‑off algorithm** – After each failed handshake the client waits `reconnectWait + jitter`, then multiplies `reconnectWait` by `reconnectFactor` (capped at `maxReconnect`). Jitter is a random fraction (`reconnectJitter`) of the current wait.  
+- **Maximum failure limit** – When `consecFails` reaches `maxConsecutiveFails`, the client reports a permanent error via `Metrics.OnPermanentError` and stops further retries.  
+- **Heartbeat** – Implemented by a ticker that calls the injected `Pinger`. If a ping fails, the connection is closed, the error is forwarded through `OnError` and `Metrics.OnPingFailure`, and the reconnect loop takes over.  
+- **Message queuing** – `Send` enqueues directly into `msgQueue`. If the queue is full, `Metrics.OnQueueDrop` (if set) is invoked and an error is returned. `writeLoop` drains the queue, re‑queues messages on transient write errors, and respects `writeTimeout`.  
+- **Graceful shutdown** – `Close` cancels the root context, closes the underlying WebSocket, and waits for all worker goroutines (`readLoop`, `writeLoop`, `heartbeat`, and the reconnect manager) to finish. `CloseWithTimeout` adds a deadline to that wait.
 
-## Comparison with Other Libraries
+## Testing
 
-- **gorilla/websocket**: Mature and widely used but lacks built-in auto-reconnect and heartbeat. gowscl adds these features while maintaining idiomatic Go.
-- **golang.org/x/net/websocket**: Deprecated; gowscl uses the modern `github.com/coder/websocket` for better performance and API.
-- **gobwas/ws** and **lesismal/nbio**: Event-driven for performance but complex. gowscl prioritizes simplicity and idiomatic Go while offering advanced features.
+The repository ships with a comprehensive test suite (`main_test.go`). Highlights:
+
+- **Default construction** – verifies that all default values match the constants defined in the source.  
+- **Custom options** – ensures functional options correctly override defaults.  
+- **Queue behavior** – tests normal queuing, overflow handling, and `SendJSON` encoding.  
+- **Successful handshake & callbacks** – spins up an in‑process echo server and validates that `OnOpen`, `OnMessage`, and `OnClose` fire as expected.  
+- **Reconnect back‑off** – injects a failing dialer and asserts that the back‑off sequence respects the configured factor, jitter, and max‑failure limit.  
+- **Heartbeat failure** – uses a flaky `Pinger` to trigger a ping error, confirming metric callbacks and connection teardown.  
+- **Graceful shutdown with timeout** – checks that `CloseWithTimeout` respects a provided context deadline.
+
+Run the tests with:
+
+```bash
+go test ./...
+```
 
 ## Roadmap
 
-- Add server-side wrapper for robust WebSocket servers.
-- Implement compression when supported by `github.com/coder/websocket`.
-- Add metrics for connection state, message throughput, and reconnect attempts.
-- Support TLS configuration and proxy settings.
-- Enhance testing with in-memory WebSocket testing (inspired by `wstest.Pipe` from `github.com/coder/websocket` roadmap).
-
-## Contributing
-
-Contributions are welcome! Please submit issues or pull requests to the [repository](https://github.com/evdnx/gowscl). Ensure code follows Go idioms and includes tests.
+- **Compression support** – enable per‑message compression when the underlying library adds it.  
+- **Extended metrics** – expose counters for messages sent/received, throughput, and connection uptime.  
+- **TLS & Proxy configuration** – allow custom transport settings.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT-0 License – see the `LICENSE` file for details.
 
 ## Acknowledgments
 
-- Built on top of [github.com/coder/websocket](https://github.com/coder/websocket).
-- Thanks to the original author, nhooyr, and the current maintainers at Coder for their work on the underlying WebSocket library.
+- Built on top of **github.com/coder/websocket**.  
+- Thanks to the original author *nhooyr* and the Coder team for their solid WebSocket implementation.
