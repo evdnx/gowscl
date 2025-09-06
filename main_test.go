@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ---------------------------------------------------------------------------
@@ -299,4 +301,263 @@ func TestClient_SendJSON(t *testing.T) {
 	default:
 		t.Fatalf("expected a message to be queued")
 	}
+}
+
+func TestClient_SubprotocolsAndHeaders(t *testing.T) {
+	// Server that checks the handshake.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify sub‑protocol header.
+		if got := r.Header.Get("Sec-WebSocket-Protocol"); got != "chat, super" {
+			t.Fatalf("unexpected sub‑protocols: %q", got)
+		}
+		// Verify custom header.
+		if got := r.Header.Get("X-Custom"); got != "magic" {
+			t.Fatalf("custom header missing: %q", got)
+		}
+		// Upgrade as usual.
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Fatalf("accept failed: %v", err)
+		}
+		_ = c.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer srv.Close()
+
+	c := NewClient(
+		"ws://"+srv.Listener.Addr().String(),
+		WithSubprotocols("chat", "super"),
+		WithHeaders(map[string][]string{
+			"X-Custom": {"magic"},
+		}),
+	)
+
+	err := c.Connect()
+	assert.NoError(t, err)
+	c.Close()
+}
+
+func TestClient_CompressionFlagIsStored(t *testing.T) {
+	c := NewClient(
+		"ws://example.com",
+		WithCompression(true),
+	)
+
+	assert.True(t, c.opts.compressionEnabled, "compression flag should be true")
+}
+
+func TestClient_Heartbeat_NoPongTriggersFailure(t *testing.T) {
+	// Server that accepts but never responds to pings.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Fatalf("accept failed: %v", err)
+		}
+		// Keep connection alive but ignore pings.
+		<-r.Context().Done()
+		_ = c.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer srv.Close()
+
+	var pingFailed, errCb bool
+	metrics := &Metrics{
+		OnPingFailure: func(err error) { pingFailed = true },
+	}
+	c := NewClient(
+		"ws://"+srv.Listener.Addr().String(),
+		WithMetrics(metrics),
+		WithOnError(func(err error) { errCb = true }),
+		WithPingInterval(30*time.Millisecond),
+		WithPongTimeout(10*time.Millisecond), // very short
+	)
+
+	_ = c.Connect()
+	// Give the heartbeat a couple of cycles.
+	time.Sleep(120 * time.Millisecond)
+
+	assert.True(t, pingFailed, "ping failure metric should fire")
+	assert.True(t, errCb, "onError callback should fire")
+	c.mu.Lock()
+	connNil := c.conn == nil
+	c.mu.Unlock()
+	assert.True(t, connNil, "connection must be cleared after ping failure")
+}
+
+func TestClient_WriteTimeoutTriggersError(t *testing.T) {
+	// Server that deliberately sleeps before echoing.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Fatalf("accept failed: %v", err)
+		}
+		typ, rdr, err := c.Reader(context.Background())
+		if err != nil {
+			return
+		}
+		// Simulate a slow consumer.
+		time.Sleep(200 * time.Millisecond)
+		data, _ := io.ReadAll(rdr)
+		wtr, _ := c.Writer(context.Background(), typ)
+		_, _ = wtr.Write(data)
+		_ = wtr.Close()
+	}))
+	defer srv.Close()
+
+	var errSeen bool
+	c := NewClient(
+		"ws://"+srv.Listener.Addr().String(),
+		WithWriteTimeout(50*time.Millisecond), // shorter than server sleep
+		WithOnError(func(err error) { errSeen = true }),
+	)
+
+	_ = c.Connect()
+	_ = c.Send([]byte("slow‑msg"), websocket.MessageText)
+
+	// Wait a bit for the write loop to hit the timeout.
+	time.Sleep(300 * time.Millisecond)
+
+	assert.True(t, errSeen, "write timeout should surface via onError")
+}
+
+func TestClient_CloseWithPendingMessages(t *testing.T) {
+	srv := startTestWSServer(t)
+	defer srv.Close()
+
+	c := NewClient(
+		"ws://"+srv.Listener.Addr().String(),
+		WithMessageQueueSize(5),
+	)
+
+	_ = c.Connect()
+
+	// Queue a handful of messages without letting the writer drain them yet.
+	for i := 0; i < 3; i++ {
+		err := c.Send([]byte(fmt.Sprintf("msg-%d", i)), websocket.MessageText)
+		assert.NoError(t, err)
+	}
+
+	// Now close with a tight deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	c.CloseWithTimeout(ctx)
+	elapsed := time.Since(start)
+
+	// The close should return promptly (deadline hit) and not deadlock.
+	assert.LessOrEqual(t, elapsed.Milliseconds(), int64(50))
+}
+
+func TestClient_MaxConsecutiveFailsStopsRetries(t *testing.T) {
+	// Dialer that always fails.
+	badDialer := func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+		return nil, nil, errors.New("always fail")
+	}
+
+	var permanentErr error
+	metrics := &Metrics{
+		OnPermanentError: func(err error) { permanentErr = err },
+	}
+
+	c := NewClient(
+		"ws://invalid",
+		WithDialer(badDialer),
+		WithMetrics(metrics),
+		WithMaxConsecutiveFailures(2),
+		WithInitialReconnect(5*time.Millisecond),
+		WithReconnectFactor(1.0), // deterministic
+		WithReconnectJitter(0.0),
+	)
+
+	// Run the client in background.
+	go func() { _ = c.Connect() }()
+
+	// Give it enough time for the two retries + final stop.
+	time.Sleep(50 * time.Millisecond)
+
+	assert.NotNil(t, permanentErr, "permanent error callback should fire")
+	assert.Contains(t, permanentErr.Error(), "max consecutive reconnect failures")
+}
+
+func TestClient_DialerReceivesHeadersAndSubprotocols(t *testing.T) {
+	var receivedOpts *websocket.DialOptions
+
+	customDialer := func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+		receivedOpts = opts
+		// Use the real dialer underneath for a successful connection.
+		return websocket.Dial(ctx, url, opts)
+	}
+
+	c := NewClient(
+		"ws://echo.websocket.org", // any reachable endpoint; we won’t actually hit it because we replace the dialer
+		WithDialer(customDialer),
+		WithSubprotocols("protoA", "protoB"),
+		WithHeaders(map[string][]string{
+			"X-Test": {"value"},
+		}),
+	)
+
+	// Connect will invoke our custom dialer.
+	_ = c.Connect()
+
+	require.NotNil(t, receivedOpts, "dial options should have been passed")
+	assert.ElementsMatch(t, []string{"protoA", "protoB"}, receivedOpts.Subprotocols)
+	assert.Equal(t, []string{"value"}, receivedOpts.HTTPHeader["X-Test"])
+}
+
+func TestClient_MetricsQueueDrop(t *testing.T) {
+	var droppedMsg queuedMessage
+	metrics := &Metrics{
+		OnQueueDrop: func(msg queuedMessage) { droppedMsg = msg },
+	}
+
+	c := NewClient(
+		"ws://example.com",
+		WithMessageQueueSize(1), // tiny queue to force overflow
+		WithMetrics(metrics),
+	)
+
+	// First message fits.
+	assert.NoError(t, c.Send([]byte("first"), websocket.MessageText))
+
+	// Second message should overflow.
+	err := c.Send([]byte("second"), websocket.MessageText)
+	assert.Error(t, err)
+	assert.Equal(t, []byte("second"), droppedMsg.data)
+}
+
+func TestClient_HandshakeTimeout(t *testing.T) {
+	// Server that sleeps before accepting.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond) // longer than client timeout
+		_, _ = websocket.Accept(w, r, nil)
+	}))
+	defer srv.Close()
+
+	c := NewClient(
+		"ws://"+srv.Listener.Addr().String(),
+		WithHandshakeTimeout(50*time.Millisecond), // short timeout
+	)
+
+	err := c.Connect()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context deadline exceeded")
+}
+
+func TestClient_CloseGracePeriod(t *testing.T) {
+	srv := startTestWSServer(t)
+	defer srv.Close()
+
+	c := NewClient(
+		"ws://"+srv.Listener.Addr().String(),
+		WithCloseGracePeriod(100*time.Millisecond),
+	)
+
+	_ = c.Connect()
+	// Kick off a graceful close.
+	start := time.Now()
+	c.Close()
+	elapsed := time.Since(start)
+
+	// The client should have waited at least the grace period (or less if the
+	// connection already terminated, but it must not return instantly).
+	assert.GreaterOrEqual(t, elapsed, 80*time.Millisecond)
 }
