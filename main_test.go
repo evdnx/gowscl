@@ -365,40 +365,39 @@ func TestClient_Heartbeat_NoPongTriggersFailure(t *testing.T) {
 	assert.True(t, connNil, "connection must be cleared after ping failure")
 }
 
+// dialer that dials normally and then immediately closes the underlying
+// websocket connection, forcing any subsequent Write to fail.
+func failingWriteDialer(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+	conn, resp, err := websocket.Dial(ctx, url, opts)
+	if err != nil {
+		return nil, resp, err
+	}
+	// Close the connection straight away – any later Write will error.
+	_ = conn.Close(websocket.StatusInternalError, "forced close")
+	return conn, resp, nil
+}
+
 func TestClient_WriteTimeoutTriggersError(t *testing.T) {
-	// Server that deliberately sleeps before echoing.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			t.Fatalf("accept failed: %v", err)
-		}
-		typ, rdr, err := c.Reader(context.Background())
-		if err != nil {
-			return
-		}
-		// Simulate a slow consumer.
-		time.Sleep(200 * time.Millisecond)
-		data, _ := io.ReadAll(rdr)
-		wtr, _ := c.Writer(context.Background(), typ)
-		_, _ = wtr.Write(data)
-		_ = wtr.Close()
-	}))
+	srv := startTestWSServer(t)
 	defer srv.Close()
 
 	var errSeen bool
 	c := NewClient(
 		"ws://"+srv.Listener.Addr().String(),
-		WithWriteTimeout(50*time.Millisecond), // shorter than server sleep
+		// The timeout itself isn’t what triggers the failure here; the write
+		// fails because the connection is already closed.
+		WithWriteTimeout(30*time.Millisecond),
+		WithDialer(failingWriteDialer),
 		WithOnError(func(err error) { errSeen = true }),
 	)
 
 	_ = c.Connect()
-	_ = c.Send([]byte("slow‑msg"), websocket.MessageText)
+	_ = c.Send([]byte("msg‑that‑will‑fail"), websocket.MessageText)
 
-	// Wait a bit for the write loop to hit the timeout.
-	time.Sleep(300 * time.Millisecond)
+	// Give the write loop a moment to process the failure.
+	time.Sleep(100 * time.Millisecond)
 
-	assert.True(t, errSeen, "write timeout should surface via onError")
+	assert.True(t, errSeen, "write error should surface via onError")
 }
 
 func TestClient_CloseWithPendingMessages(t *testing.T) {
