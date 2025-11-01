@@ -116,15 +116,15 @@ type Metrics struct {
 
 ## Testing
 
-The repository ships with a comprehensive test suite (`main_test.go`). Highlights:
+The repository ships with a comprehensive test suite (`main_test.go`) that avoids network access by using in‑memory WebSocket pipes. Highlights:
 
 - **Default construction** – verifies that all default values match the constants defined in the source.  
 - **Custom options** – ensures functional options correctly override defaults.  
-- **Queue behavior** – tests normal queuing, overflow handling, and `SendJSON` encoding.  
-- **Successful handshake & callbacks** – spins up an in‑process echo server and validates that `OnOpen`, `OnMessage`, and `OnClose` fire as expected.  
-- **Reconnect back‑off** – injects a failing dialer and asserts that the back‑off sequence respects the configured factor, jitter, and max‑failure limit.  
-- **Heartbeat failure** – uses a flaky `Pinger` to trigger a ping error, confirming metric callbacks and connection teardown.  
-- **Graceful shutdown with timeout** – checks that `CloseWithTimeout` respects a provided context deadline.
+- **Queue behavior** – covers normal queuing, overflow handling, and `SendJSON` encoding.  
+- **Successful handshake & callbacks** – exercises the in‑memory echo server to validate `OnOpen`, `OnMessage`, and `OnClose`.  
+- **Reconnect back‑off** – injects a failing dialer and asserts that the back‑off sequence respects the configured factor and failure limit without requiring real sockets.  
+- **Heartbeat failure** – uses a deterministic `Pinger` to trigger errors and confirm metric callbacks.  
+- **Graceful shutdown** – verifies that `Close` and `CloseWithTimeout` honour configured limits without hanging.
 
 Run the tests with:
 

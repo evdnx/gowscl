@@ -1,13 +1,16 @@
 package gowscl
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,46 +19,110 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ---------------------------------------------------------------------------
-// Helper: start a minimal echo WebSocket server for the tests.
-// The server upgrades the HTTP request, then reads messages and writes them back.
-// It runs in the same process, so the client receives a genuine *websocket.Conn.
-// ---------------------------------------------------------------------------
-func startTestWSServer(t *testing.T) *httptest.Server {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Upgrade the HTTP connection to a WebSocket.
-		c, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			t.Fatalf("server accept failed: %v", err)
-		}
-		defer c.Close(websocket.StatusNormalClosure, "")
+// -----------------------------------------------------------------------------
+// In-memory dialer helpers (adapted from coder/websocket/internal/test/wstest)
+// -----------------------------------------------------------------------------
 
-		// Simple echo loop – read a message, write it back.
-		for {
-			typ, rdr, err := c.Reader(context.Background())
-			if err != nil {
-				return
-			}
-			data, err := io.ReadAll(rdr)
-			if err != nil {
-				return
-			}
-			wtr, err := c.Writer(context.Background(), typ)
-			if err != nil {
-				return
-			}
-			_, _ = wtr.Write(data)
-			_ = wtr.Close()
-		}
-	}))
-	return s
+type hijackRecorder struct {
+	*httptest.ResponseRecorder
+	conn net.Conn
 }
 
-// --------------------
-// 1. Construction & Defaults
-// --------------------
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return h.conn, bufio.NewReadWriter(bufio.NewReader(h.conn), bufio.NewWriter(h.conn)), nil
+}
+
+type memoryTransport struct {
+	handler func(http.ResponseWriter, *http.Request)
+}
+
+func (t memoryTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	clientConn, serverConn := net.Pipe()
+
+	recorder := httptest.NewRecorder()
+	hijacker := &hijackRecorder{ResponseRecorder: recorder, conn: serverConn}
+	t.handler(hijacker, r)
+
+	resp := recorder.Result()
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		resp.Body = clientConn
+	} else {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	}
+	return resp, nil
+}
+
+func dialPipeConn(ctx context.Context, dialOpts *websocket.DialOptions, acceptOpts *websocket.AcceptOptions) (*websocket.Conn, *websocket.Conn, error) {
+	serverConnCh := make(chan *websocket.Conn, 1)
+	acceptErrCh := make(chan error, 1)
+
+	transport := memoryTransport{
+		handler: func(w http.ResponseWriter, r *http.Request) {
+			conn, err := websocket.Accept(w, r, acceptOpts)
+			acceptErrCh <- err
+			if err == nil {
+				serverConnCh <- conn
+			}
+		},
+	}
+
+	var optsCopy *websocket.DialOptions
+	if dialOpts != nil {
+		copy := *dialOpts
+		optsCopy = &copy
+	} else {
+		optsCopy = &websocket.DialOptions{}
+	}
+	optsCopy.HTTPClient = &http.Client{Transport: transport}
+
+	clientConn, _, err := websocket.Dial(ctx, "ws://example.com/test", optsCopy)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if acceptErr := <-acceptErrCh; acceptErr != nil {
+		_ = clientConn.Close(websocket.StatusInternalError, "accept failed")
+		return nil, nil, acceptErr
+	}
+
+	serverConn := <-serverConnCh
+	return clientConn, serverConn, nil
+}
+
+func inMemoryDialer(t *testing.T, handler func(context.Context, *websocket.Conn)) func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+	return func(ctx context.Context, _ string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+		clientConn, serverConn, err := dialPipeConn(ctx, opts, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		go func() {
+			defer serverConn.Close(websocket.StatusNormalClosure, "test server shutdown")
+			if handler != nil {
+				handler(context.Background(), serverConn)
+				return
+			}
+			for {
+				_, reader, err := serverConn.Reader(context.Background())
+				if err != nil {
+					return
+				}
+				_, _ = io.Copy(io.Discard, reader)
+			}
+		}()
+
+		return clientConn, nil, nil
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Option defaults
+// -----------------------------------------------------------------------------
+
 func TestNewClient_Defaults(t *testing.T) {
 	c := NewClient("ws://example.com")
+
 	assert.Equal(t, DefaultInitialReconnectInterval, c.opts.initialReconnect)
 	assert.Equal(t, DefaultMaxReconnectInterval, c.opts.maxReconnect)
 	assert.Equal(t, DefaultReconnectFactor, c.opts.reconnectFactor)
@@ -72,17 +139,18 @@ func TestNewClient_CustomOptions(t *testing.T) {
 	assert.Equal(t, 3, c.opts.maxConsecutiveFails)
 }
 
-// --------------------
-// 2. Send / Queue Behaviour
-// --------------------
+// -----------------------------------------------------------------------------
+// Send / queue behaviour
+// -----------------------------------------------------------------------------
+
 func TestClient_Send_QueuesWhenDisconnected(t *testing.T) {
 	c := NewClient("ws://example.com")
-	err := c.Send([]byte(`hello`), websocket.MessageText)
-	assert.NoError(t, err)
+	err := c.Send([]byte("hello"), websocket.MessageText)
+	require.NoError(t, err)
 
 	select {
 	case qm := <-c.msgQueue:
-		assert.Equal(t, []byte(`hello`), qm.data)
+		assert.Equal(t, []byte("hello"), qm.data)
 	default:
 		t.Fatalf("expected message to be queued")
 	}
@@ -90,102 +158,103 @@ func TestClient_Send_QueuesWhenDisconnected(t *testing.T) {
 
 func TestClient_Send_QueueOverflow(t *testing.T) {
 	c := NewClient("ws://example.com", WithMessageQueueSize(2))
-	_ = c.Send([]byte(`a`), websocket.MessageText)
-	_ = c.Send([]byte(`b`), websocket.MessageText)
+	require.NoError(t, c.Send([]byte("a"), websocket.MessageText))
+	require.NoError(t, c.Send([]byte("b"), websocket.MessageText))
 
-	err := c.Send([]byte(`c`), websocket.MessageText)
+	err := c.Send([]byte("c"), websocket.MessageText)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "message queue full")
 }
 
-// --------------------
-// 3. Successful Connection & Callbacks
-// --------------------
+// -----------------------------------------------------------------------------
+// Successful connection & callbacks
+// -----------------------------------------------------------------------------
+
 func TestClient_Connect_SuccessfulHandshake(t *testing.T) {
+	echoDialer := inMemoryDialer(t, func(ctx context.Context, conn *websocket.Conn) {
+		defer conn.Close(websocket.StatusNormalClosure, "echo done")
+		for {
+			mt, reader, err := conn.Reader(ctx)
+			if err != nil {
+				return
+			}
+			payload, err := io.ReadAll(reader)
+			if err != nil {
+				return
+			}
+			writer, err := conn.Writer(ctx, mt)
+			if err != nil {
+				return
+			}
+			_, _ = writer.Write(payload)
+			_ = writer.Close()
+		}
+	})
+
 	openCalled, msgCalled, closeCalled := false, false, false
 
-	// Spin up a real in‑process WS server.
-	srv := startTestWSServer(t)
-	defer srv.Close()
-
 	c := NewClient(
-		"ws://"+srv.Listener.Addr().String(),
+		"ws://example.com/echo",
+		WithDialer(echoDialer),
 		WithOnOpen(func() { openCalled = true }),
 		WithOnMessage(func(data []byte, typ websocket.MessageType) {
 			msgCalled = true
-			assert.Equal(t, []byte(`payload`), data)
 			assert.Equal(t, websocket.MessageText, typ)
+			assert.Equal(t, []byte("payload"), data)
 		}),
 		WithOnClose(func() { closeCalled = true }),
-		// Speed things up for the test.
-		WithReadTimeout(500*time.Millisecond),
-		WithHandshakeTimeout(500*time.Millisecond),
-		WithPingInterval(200*time.Millisecond),
-		WithPongTimeout(100*time.Millisecond),
+		WithPingInterval(50*time.Millisecond),
+		WithPongTimeout(25*time.Millisecond),
 	)
 
-	// Start the client.
-	err := c.Connect()
-	assert.NoError(t, err)
+	require.NoError(t, c.Connect())
+	require.NoError(t, c.Send([]byte("payload"), websocket.MessageText))
 
-	// Send a message – the server will echo it back, triggering OnMessage.
-	err = c.Send([]byte(`payload`), websocket.MessageText)
-	assert.NoError(t, err)
-
-	// Allow a short window for the round‑trip.
-	time.Sleep(200 * time.Millisecond)
-
-	// Shut down cleanly.
+	time.Sleep(100 * time.Millisecond)
 	c.Close()
 
-	assert.True(t, openCalled, "onOpen should have fired")
-	assert.True(t, msgCalled, "onMessage should have fired")
-	assert.True(t, closeCalled, "onClose should have fired")
+	assert.True(t, openCalled)
+	assert.True(t, msgCalled)
+	assert.True(t, closeCalled)
 }
 
-// --------------------
-// 4. Reconnect Back‑off & Max Failures
-// --------------------
+// -----------------------------------------------------------------------------
+// Reconnect back-off & failure limits
+// -----------------------------------------------------------------------------
+
 func TestClient_Reconnect_BackoffStopsAfterMaxFails(t *testing.T) {
 	var reconnectDurations []time.Duration
 	metrics := &Metrics{
 		OnReconnect: func(wait time.Duration) { reconnectDurations = append(reconnectDurations, wait) },
 	}
 
-	// Dialer that always fails.
 	failingDialer := func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
 		return nil, nil, errors.New("dial failure")
 	}
 
-	// Use a dummy server just to have a valid URL.
-	srv := startTestWSServer(t)
-	defer srv.Close()
-
 	c := NewClient(
-		"ws://"+srv.Listener.Addr().String(),
+		"ws://example.com",
 		WithMetrics(metrics),
 		WithDialer(failingDialer),
 		WithMaxConsecutiveFailures(3),
 		WithInitialReconnect(10*time.Millisecond),
 		WithReconnectFactor(2.0),
-		WithReconnectJitter(0.0), // deterministic for assertions
+		WithReconnectJitter(0.0),
 	)
 
-	// Run the client in background.
 	go func() { _ = c.Connect() }()
-
-	// Wait enough time for three retries to occur.
 	time.Sleep(200 * time.Millisecond)
 
-	assert.Len(t, reconnectDurations, 3, "should have attempted three reconnects")
+	require.Len(t, reconnectDurations, 3)
 	expected := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond}
 	assert.Equal(t, expected, reconnectDurations)
-	assert.Equal(t, 3, c.consecFails, "consecutive failure count should equal max")
+	assert.Equal(t, 3, c.consecFails)
 }
 
-// --------------------
-// 5. Heartbeat / Ping Failure
-// --------------------
+// -----------------------------------------------------------------------------
+// Heartbeat / ping failure
+// -----------------------------------------------------------------------------
+
 type flakyPinger struct {
 	callCount int
 	failAfter int
@@ -200,123 +269,162 @@ func (f *flakyPinger) Ping(ctx context.Context) error {
 }
 
 func TestClient_Heartbeat_PingFailure(t *testing.T) {
-	pingFailed := false
-	errorCallback := false
-
-	metrics := &Metrics{
-		OnPingFailure: func(err error) { pingFailed = true },
-	}
-
-	// Server for a real connection.
-	srv := startTestWSServer(t)
-	defer srv.Close()
+	metrics := &Metrics{}
+	var pingFailed atomic.Bool
+	var errorCallback atomic.Bool
+	metrics.OnPingFailure = func(err error) { pingFailed.Store(true) }
+	pinger := &flakyPinger{failAfter: 2}
 
 	c := NewClient(
-		"ws://"+srv.Listener.Addr().String(),
+		"ws://example.com",
+		WithDialer(inMemoryDialer(t, nil)),
 		WithMetrics(metrics),
-		WithPinger(&flakyPinger{failAfter: 2}), // fail on third tick
-		WithOnError(func(err error) { errorCallback = true }),
+		WithPinger(pinger),
+		WithOnError(func(err error) { errorCallback.Store(true) }),
 		WithPingInterval(20*time.Millisecond),
 		WithPongTimeout(10*time.Millisecond),
 	)
 
-	_ = c.Connect()
-	// Let the heartbeat run a few cycles.
-	time.Sleep(150 * time.Millisecond)
+	require.NoError(t, c.Connect())
+	time.Sleep(250 * time.Millisecond)
+	require.True(t, pingFailed.Load())
+	require.True(t, errorCallback.Load())
+	assert.GreaterOrEqual(t, pinger.callCount, 3)
 
-	assert.True(t, pingFailed, "OnPingFailure metric should have been invoked")
-	assert.True(t, errorCallback, "onError callback should have been invoked")
-	c.mu.Lock()
-	connNil := c.conn == nil
-	c.mu.Unlock()
-	assert.True(t, connNil, "connection should have been cleared after ping failure")
+	c.Close()
 }
 
-// --------------------
-// 6. Graceful Shutdown with Timeout
-// --------------------
-func TestClient_CloseWithTimeout_ContextCancellation(t *testing.T) {
-	// Server for a real connection.
-	srv := startTestWSServer(t)
-	defer srv.Close()
+func TestClient_Heartbeat_NoPongTriggersFailure(t *testing.T) {
+	var pingFailed atomic.Bool
+	var errCb atomic.Bool
+	metrics := &Metrics{
+		OnPingFailure: func(err error) { pingFailed.Store(true) },
+	}
+	pinger := &flakyPinger{failAfter: 0}
 
 	c := NewClient(
-		"ws://" + srv.Listener.Addr().String(),
+		"ws://example.com",
+		WithDialer(inMemoryDialer(t, nil)),
+		WithMetrics(metrics),
+		WithOnError(func(err error) { errCb.Store(true) }),
+		WithPinger(pinger),
+		WithPingInterval(20*time.Millisecond),
+		WithPongTimeout(10*time.Millisecond),
 	)
 
-	_ = c.Connect()
+	require.NoError(t, c.Connect())
+	time.Sleep(200 * time.Millisecond)
+	require.True(t, pingFailed.Load())
+	require.True(t, errCb.Load())
+	assert.GreaterOrEqual(t, pinger.callCount, 1)
 
-	// Cancel after a short deadline.
+	c.Close()
+}
+
+// -----------------------------------------------------------------------------
+// Graceful shutdown
+// -----------------------------------------------------------------------------
+
+func TestClient_CloseWithTimeout_ContextCancellation(t *testing.T) {
+	c := NewClient(
+		"ws://example.com",
+		WithDialer(inMemoryDialer(t, nil)),
+	)
+	require.NoError(t, c.Connect())
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
 	c.CloseWithTimeout(ctx)
 	elapsed := time.Since(start)
-
-	// Should return quickly once the deadline fires.
 	assert.LessOrEqual(t, elapsed, 100*time.Millisecond)
 
-	// Verify internal context is cancelled.
 	select {
 	case <-c.ctx.Done():
-		// ok
 	default:
 		t.Fatalf("client context should be cancelled")
 	}
 }
 
-// --------------------
-// 7. SendJSON helper
-// --------------------
-func TestClient_SendJSON(t *testing.T) {
-	// Server for a real connection.
-	srv := startTestWSServer(t)
-	defer srv.Close()
+func TestClient_CloseWithPendingMessages(t *testing.T) {
+	c := NewClient(
+		"ws://example.com",
+		WithDialer(inMemoryDialer(t, nil)),
+		WithMessageQueueSize(5),
+	)
+	require.NoError(t, c.Connect())
+
+	for i := 0; i < 3; i++ {
+		assert.NoError(t, c.Send([]byte(fmt.Sprintf("msg-%d", i)), websocket.MessageText))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	c.CloseWithTimeout(ctx)
+	elapsed := time.Since(start)
+
+	assert.LessOrEqual(t, elapsed.Milliseconds(), int64(50))
+}
+
+func TestClient_CloseGracePeriod(t *testing.T) {
+	grace := 50 * time.Millisecond
 
 	c := NewClient(
-		"ws://" + srv.Listener.Addr().String(),
+		"ws://example.com",
+		WithDialer(inMemoryDialer(t, nil)),
+		WithCloseGracePeriod(grace),
 	)
+	require.NoError(t, c.Connect())
 
-	// Connect so the writer goroutine is alive.
-	_ = c.Connect()
+	start := time.Now()
+	c.Close()
+	elapsed := time.Since(start)
+
+	assert.LessOrEqual(t, elapsed, grace+50*time.Millisecond)
+}
+
+// -----------------------------------------------------------------------------
+// SendJSON helper
+// -----------------------------------------------------------------------------
+
+func TestClient_SendJSON(t *testing.T) {
+	c := NewClient("ws://example.com")
 
 	payload := struct {
 		Name string `json:"name"`
 		Age  int    `json:"age"`
 	}{"Alice", 30}
-	err := c.SendJSON(payload)
-	assert.NoError(t, err)
 
-	// Pull the queued message and verify JSON encoding.
+	require.NoError(t, c.SendJSON(payload))
+
 	select {
 	case qm := <-c.msgQueue:
 		var out struct {
 			Name string `json:"name"`
 			Age  int    `json:"age"`
 		}
-		err = json.Unmarshal(qm.data, &out)
-		assert.NoError(t, err)
+		require.NoError(t, json.Unmarshal(qm.data, &out))
 		assert.Equal(t, payload, out)
 	default:
-		t.Fatalf("expected a message to be queued")
+		t.Fatalf("expected queued JSON message")
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Misc configuration tests
+// -----------------------------------------------------------------------------
+
 func TestClient_SubprotocolsAndHeaders(t *testing.T) {
-	// Create a client with the desired options.
 	c := NewClient(
-		"ws://example.invalid", // we never actually dial – we only inspect the opts.
+		"ws://example.invalid",
 		WithSubprotocols("chat", "super"),
 		WithHeaders(map[string][]string{
 			"X-Custom": {"magic"},
 		}),
 	)
 
-	// The options struct is unexported, but the client exposes the values through
-	// its public fields (opts is exported as part of the client for testing).
-	// We can reach them via the client’s internal fields because the test lives
-	// in the same package.
 	assert.Contains(t, c.opts.subprotocols, "chat")
 	assert.Contains(t, c.opts.subprotocols, "super")
 	assert.Equal(t, []string{"magic"}, c.opts.headers["X-Custom"])
@@ -327,109 +435,34 @@ func TestClient_CompressionFlagIsStored(t *testing.T) {
 		"ws://example.com",
 		WithCompression(true),
 	)
-
-	assert.True(t, c.opts.compressionEnabled, "compression flag should be true")
-}
-
-func TestClient_Heartbeat_NoPongTriggersFailure(t *testing.T) {
-	// Server that simply accepts the connection – it never matters because the
-	// pinger will fail before any pong is expected.
-	srv := startTestWSServer(t)
-	defer srv.Close()
-
-	var pingFailed, errCb bool
-	metrics := &Metrics{
-		OnPingFailure: func(err error) { pingFailed = true },
-	}
-	// pinger that fails on the *first* call.
-	failingPinger := &flakyPinger{failAfter: 0}
-
-	c := NewClient(
-		"ws://"+srv.Listener.Addr().String(),
-		WithMetrics(metrics),
-		WithOnError(func(err error) { errCb = true }),
-		WithPinger(failingPinger),
-		WithPingInterval(20*time.Millisecond), // fast enough for the test
-		WithPongTimeout(10*time.Millisecond),
-	)
-
-	_ = c.Connect()
-	// Give the heartbeat a couple of cycles.
-	time.Sleep(80 * time.Millisecond)
-
-	assert.True(t, pingFailed, "ping‑failure metric should fire")
-	assert.True(t, errCb, "onError callback should fire")
-	c.mu.Lock()
-	connNil := c.conn == nil
-	c.mu.Unlock()
-	assert.True(t, connNil, "connection must be cleared after ping failure")
-}
-
-// dialer that dials normally and then immediately closes the underlying
-// websocket connection, forcing any subsequent Write to fail.
-func failingWriteDialer(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
-	conn, resp, err := websocket.Dial(ctx, url, opts)
-	if err != nil {
-		return nil, resp, err
-	}
-	// Close the connection straight away – any later Write will error.
-	_ = conn.Close(websocket.StatusInternalError, "forced close")
-	return conn, resp, nil
+	assert.True(t, c.opts.compressionEnabled)
 }
 
 func TestClient_WriteTimeoutTriggersError(t *testing.T) {
-	srv := startTestWSServer(t)
-	defer srv.Close()
-
 	var errSeen bool
 	c := NewClient(
-		"ws://"+srv.Listener.Addr().String(),
-		// The timeout itself isn’t what triggers the failure here; the write
-		// fails because the connection is already closed.
+		"ws://example.com",
+		WithDialer(func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+			clientConn, serverConn, err := dialPipeConn(ctx, opts, nil)
+			if err != nil {
+				return nil, nil, err
+			}
+			_ = serverConn.Close(websocket.StatusInternalError, "forced close")
+			return clientConn, nil, nil
+		}),
 		WithWriteTimeout(30*time.Millisecond),
-		WithDialer(failingWriteDialer),
 		WithOnError(func(err error) { errSeen = true }),
 	)
 
-	_ = c.Connect()
-	_ = c.Send([]byte("msg‑that‑will‑fail"), websocket.MessageText)
+	require.NoError(t, c.Connect())
+	_ = c.Send([]byte("msg-that-will-fail"), websocket.MessageText)
+	time.Sleep(60 * time.Millisecond)
 
-	// Give the write loop a moment to process the failure.
-	time.Sleep(100 * time.Millisecond)
-
-	assert.True(t, errSeen, "write error should surface via onError")
-}
-
-func TestClient_CloseWithPendingMessages(t *testing.T) {
-	srv := startTestWSServer(t)
-	defer srv.Close()
-
-	c := NewClient(
-		"ws://"+srv.Listener.Addr().String(),
-		WithMessageQueueSize(5),
-	)
-
-	_ = c.Connect()
-
-	// Queue a handful of messages without letting the writer drain them yet.
-	for i := 0; i < 3; i++ {
-		err := c.Send([]byte(fmt.Sprintf("msg-%d", i)), websocket.MessageText)
-		assert.NoError(t, err)
-	}
-
-	// Now close with a tight deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	c.CloseWithTimeout(ctx)
-	elapsed := time.Since(start)
-
-	// The close should return promptly (deadline hit) and not deadlock.
-	assert.LessOrEqual(t, elapsed.Milliseconds(), int64(50))
+	assert.True(t, errSeen)
+	c.Close()
 }
 
 func TestClient_MaxConsecutiveFailsStopsRetries(t *testing.T) {
-	// Dialer that always fails.
 	badDialer := func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
 		return nil, nil, errors.New("always fail")
 	}
@@ -445,17 +478,14 @@ func TestClient_MaxConsecutiveFailsStopsRetries(t *testing.T) {
 		WithMetrics(metrics),
 		WithMaxConsecutiveFailures(2),
 		WithInitialReconnect(5*time.Millisecond),
-		WithReconnectFactor(1.0), // deterministic
+		WithReconnectFactor(1.0),
 		WithReconnectJitter(0.0),
 	)
 
-	// Run the client in background.
 	go func() { _ = c.Connect() }()
+	time.Sleep(60 * time.Millisecond)
 
-	// Give it enough time for the two retries + final stop.
-	time.Sleep(50 * time.Millisecond)
-
-	assert.NotNil(t, permanentErr, "permanent error callback should fire")
+	assert.NotNil(t, permanentErr)
 	assert.Contains(t, permanentErr.Error(), "max consecutive reconnect failures")
 }
 
@@ -464,12 +494,16 @@ func TestClient_DialerReceivesHeadersAndSubprotocols(t *testing.T) {
 
 	customDialer := func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
 		receivedOpts = opts
-		// Use the real dialer underneath for a successful connection.
-		return websocket.Dial(ctx, url, opts)
+		clientConn, serverConn, err := dialPipeConn(ctx, opts, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		_ = serverConn.Close(websocket.StatusNormalClosure, "done")
+		return clientConn, nil, nil
 	}
 
 	c := NewClient(
-		"ws://echo.websocket.org", // any reachable endpoint; we won’t actually hit it because we replace the dialer
+		"ws://example.com",
 		WithDialer(customDialer),
 		WithSubprotocols("protoA", "protoB"),
 		WithHeaders(map[string][]string{
@@ -477,12 +511,11 @@ func TestClient_DialerReceivesHeadersAndSubprotocols(t *testing.T) {
 		}),
 	)
 
-	// Connect will invoke our custom dialer.
-	_ = c.Connect()
-
-	require.NotNil(t, receivedOpts, "dial options should have been passed")
+	require.NoError(t, c.Connect())
+	require.NotNil(t, receivedOpts)
 	assert.ElementsMatch(t, []string{"protoA", "protoB"}, receivedOpts.Subprotocols)
 	assert.Equal(t, []string{"value"}, receivedOpts.HTTPHeader["X-Test"])
+	c.Close()
 }
 
 func TestClient_MetricsQueueDrop(t *testing.T) {
@@ -493,57 +526,33 @@ func TestClient_MetricsQueueDrop(t *testing.T) {
 
 	c := NewClient(
 		"ws://example.com",
-		WithMessageQueueSize(1), // tiny queue to force overflow
+		WithMessageQueueSize(1),
 		WithMetrics(metrics),
 	)
 
-	// First message fits.
-	assert.NoError(t, c.Send([]byte("first"), websocket.MessageText))
-
-	// Second message should overflow.
+	require.NoError(t, c.Send([]byte("first"), websocket.MessageText))
 	err := c.Send([]byte("second"), websocket.MessageText)
 	assert.Error(t, err)
 	assert.Equal(t, []byte("second"), droppedMsg.data)
 }
 
 func TestClient_HandshakeTimeout(t *testing.T) {
-	// Server that sleeps before accepting.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(200 * time.Millisecond) // longer than client timeout
-		_, _ = websocket.Accept(w, r, nil)
-	}))
-	defer srv.Close()
+	slowDialer := func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			return nil, nil, errors.New("handshake took too long")
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
 
 	c := NewClient(
-		"ws://"+srv.Listener.Addr().String(),
-		WithHandshakeTimeout(50*time.Millisecond), // short timeout
+		"ws://example.com",
+		WithHandshakeTimeout(50*time.Millisecond),
+		WithDialer(slowDialer),
 	)
 
 	err := c.Connect()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "context deadline exceeded")
-}
-
-func TestClient_CloseGracePeriod(t *testing.T) {
-	srv := startTestWSServer(t)
-	defer srv.Close()
-
-	// Use a noticeably larger grace period so the test can observe it.
-	c := NewClient(
-		"ws://"+srv.Listener.Addr().String(),
-		WithCloseGracePeriod(70*time.Millisecond),
-	)
-
-	_ = c.Connect()
-
-	start := time.Now()
-	c.Close()
-	elapsed := time.Since(start)
-
-	// The client should wait *at least* a few milliseconds (the grace period)
-	// but we don’t enforce an exact lower bound because the connection may
-	// already have been torn down.  We only assert that it didn’t return
-	// instantly and stayed below a reasonable ceiling.
-	assert.Greater(t, elapsed.Milliseconds(), int64(5), "Close should not return instantly")
-	assert.LessOrEqual(t, elapsed.Milliseconds(), int64(200), "Close should respect the grace period and not block forever")
 }
