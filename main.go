@@ -323,16 +323,17 @@ func (c *Client) CloseWithTimeout(parent context.Context) {
 		return
 	}
 	c.closed = true
-	c.mu.Unlock()
-
-	c.cancel()
-
-	c.mu.Lock()
 	conn := c.conn
 	c.mu.Unlock()
+
+	// Close the connection first with a normal closure status before cancelling
+	// the context. This ensures goroutines see the clean close status rather
+	// than racing to close with an error status.
 	if conn != nil {
 		c.disconnectConn(conn, websocket.StatusNormalClosure, "client closing")
 	}
+
+	c.cancel()
 
 	done := make(chan struct{})
 	go func() {
@@ -554,10 +555,11 @@ func (c *Client) disconnectConn(conn *websocket.Conn, status StatusCode, reason 
 		return
 	}
 
-	_ = conn.Close(status, reason)
-
 	c.mu.Lock()
+	// Only close if this is still the active connection. This prevents
+	// multiple goroutines from closing the same connection multiple times.
 	if c.conn == conn {
+		_ = conn.Close(status, reason)
 		if c.connClosed != nil {
 			close(c.connClosed)
 		}
@@ -583,10 +585,15 @@ func (c *Client) readLoop(conn *websocket.Conn, done <-chan struct{}) {
 		default:
 		}
 
-		readCtx, cancel := context.WithTimeout(c.ctx, c.opts.readTimeout)
-		typ, data, err := conn.Read(readCtx)
-		cancel()
+		// Use client context directly. The heartbeat goroutine handles
+		// detecting dead connections via ping/pong. Using a timeout here
+		// would incorrectly drop idle connections that don't send messages.
+		typ, data, err := conn.Read(c.ctx)
 		if err != nil {
+			if c.ctx.Err() != nil {
+				// Client is closing, don't report as error.
+				return
+			}
 			if status := websocket.CloseStatus(err); status == websocket.StatusNormalClosure {
 				return
 			}

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -223,9 +224,18 @@ func TestClient_Connect_SuccessfulHandshake(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestClient_Reconnect_BackoffStopsAfterMaxFails(t *testing.T) {
+	var mu sync.Mutex
 	var reconnectDurations []time.Duration
+	done := make(chan struct{})
 	metrics := &Metrics{
-		OnReconnect: func(wait time.Duration) { reconnectDurations = append(reconnectDurations, wait) },
+		OnReconnect: func(wait time.Duration) {
+			mu.Lock()
+			reconnectDurations = append(reconnectDurations, wait)
+			mu.Unlock()
+		},
+		OnPermanentError: func(err error) {
+			close(done)
+		},
 	}
 
 	failingDialer := func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
@@ -243,12 +253,18 @@ func TestClient_Reconnect_BackoffStopsAfterMaxFails(t *testing.T) {
 	)
 
 	go func() { _ = c.Connect() }()
-	time.Sleep(200 * time.Millisecond)
 
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for permanent error")
+	}
+
+	mu.Lock()
 	require.Len(t, reconnectDurations, 3)
 	expected := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond}
 	assert.Equal(t, expected, reconnectDurations)
-	assert.Equal(t, 3, c.consecFails)
+	mu.Unlock()
 }
 
 // -----------------------------------------------------------------------------
@@ -439,7 +455,7 @@ func TestClient_CompressionFlagIsStored(t *testing.T) {
 }
 
 func TestClient_WriteTimeoutTriggersError(t *testing.T) {
-	var errSeen bool
+	var errSeen atomic.Bool
 	c := NewClient(
 		"ws://example.com",
 		WithDialer(func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
@@ -451,14 +467,14 @@ func TestClient_WriteTimeoutTriggersError(t *testing.T) {
 			return clientConn, nil, nil
 		}),
 		WithWriteTimeout(30*time.Millisecond),
-		WithOnError(func(err error) { errSeen = true }),
+		WithOnError(func(err error) { errSeen.Store(true) }),
 	)
 
 	require.NoError(t, c.Connect())
 	_ = c.Send([]byte("msg-that-will-fail"), websocket.MessageText)
 	time.Sleep(60 * time.Millisecond)
 
-	assert.True(t, errSeen)
+	assert.True(t, errSeen.Load())
 	c.Close()
 }
 
@@ -467,9 +483,9 @@ func TestClient_MaxConsecutiveFailsStopsRetries(t *testing.T) {
 		return nil, nil, errors.New("always fail")
 	}
 
-	var permanentErr error
+	permanentErrCh := make(chan error, 1)
 	metrics := &Metrics{
-		OnPermanentError: func(err error) { permanentErr = err },
+		OnPermanentError: func(err error) { permanentErrCh <- err },
 	}
 
 	c := NewClient(
@@ -483,10 +499,14 @@ func TestClient_MaxConsecutiveFailsStopsRetries(t *testing.T) {
 	)
 
 	go func() { _ = c.Connect() }()
-	time.Sleep(60 * time.Millisecond)
 
-	assert.NotNil(t, permanentErr)
-	assert.Contains(t, permanentErr.Error(), "max consecutive reconnect failures")
+	select {
+	case permanentErr := <-permanentErrCh:
+		assert.NotNil(t, permanentErr)
+		assert.Contains(t, permanentErr.Error(), "max consecutive reconnect failures")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout waiting for permanent error")
+	}
 }
 
 func TestClient_DialerReceivesHeadersAndSubprotocols(t *testing.T) {
