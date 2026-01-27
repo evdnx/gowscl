@@ -504,8 +504,59 @@ func TestClient_MaxConsecutiveFailsStopsRetries(t *testing.T) {
 	case permanentErr := <-permanentErrCh:
 		assert.NotNil(t, permanentErr)
 		assert.Contains(t, permanentErr.Error(), "max consecutive reconnect failures")
+		assert.ErrorIs(t, c.PermanentError(), ErrPermanentFailure)
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("timeout waiting for permanent error")
+	}
+}
+
+func TestClient_PermanentErrorMarksClosedAndCallsOnClose(t *testing.T) {
+	badDialer := func(ctx context.Context, url string, opts *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+		return nil, nil, errors.New("always fail")
+	}
+
+	permanentErrCh := make(chan error, 1)
+	closedCalled := make(chan struct{}, 1)
+	metrics := &Metrics{
+		OnPermanentError: func(err error) { permanentErrCh <- err },
+	}
+
+	c := NewClient(
+		"ws://invalid",
+		WithDialer(badDialer),
+		WithMetrics(metrics),
+		WithMaxConsecutiveFailures(1),
+		WithInitialReconnect(5*time.Millisecond),
+		WithReconnectFactor(1.0),
+		WithReconnectJitter(0.0),
+		WithOnClose(func() { closedCalled <- struct{}{} }),
+	)
+
+	go func() { _ = c.Connect() }()
+
+	select {
+	case <-permanentErrCh:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("timeout waiting for permanent error")
+	}
+
+	// OnClose should have been invoked when the client marked itself closed.
+	select {
+	case <-closedCalled:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected OnClose to be called after permanent failure")
+	}
+
+	// Subsequent send attempts should fail fast with ErrClosed.
+	err := c.Send([]byte("later"), websocket.MessageText)
+	assert.ErrorIs(t, err, ErrPermanentFailure)
+	assert.ErrorIs(t, c.PermanentError(), ErrPermanentFailure)
+
+	// Context should be cancelled as well.
+	select {
+	case <-c.ctx.Done():
+	default:
+		t.Fatalf("client context should be cancelled after permanent error")
 	}
 }
 

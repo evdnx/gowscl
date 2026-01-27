@@ -59,6 +59,10 @@ const (
 // ErrClosed indicates the client is closed.
 var ErrClosed = errors.New("client closed")
 
+// ErrPermanentFailure indicates the client gave up reconnecting after reaching
+// the configured maximum consecutive failures.
+var ErrPermanentFailure = errors.New("permanent failure after max reconnect attempts")
+
 var errQueueFull = errors.New("message queue full")
 
 // ---------------------------------------------------------------------------
@@ -76,6 +80,8 @@ type Client struct {
 	conn       *websocket.Conn
 	connClosed chan struct{}
 	closed     bool
+	// permanentFailure is set when the client exhausts all reconnect attempts.
+	permanentFailure error
 
 	msgQueue chan queuedMessage
 	wg       sync.WaitGroup
@@ -548,6 +554,25 @@ func (c *Client) handlePermanentError(lastErr error) {
 		golog.Int("consecutive_fails", c.consecFails),
 		golog.Err(err),
 	)
+
+	// Mark the client as closed and cancel the context so future Send calls
+	// fail fast instead of enqueueing messages that will never be delivered.
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.permanentFailure = ErrPermanentFailure
+	conn := c.conn
+	c.mu.Unlock()
+
+	// Best-effort close of an existing connection (if any) before cancelling.
+	c.disconnectConn(conn, websocket.StatusInternalError, "permanent reconnect failure")
+
+	// Stop all goroutines and unblock Send/Close callers.
+	c.cancel()
+	c.callOnClose()
 }
 
 func (c *Client) disconnectConn(conn *websocket.Conn, status StatusCode, reason string) {
@@ -662,8 +687,12 @@ func (c *Client) heartbeat(pinger Pinger, conn *websocket.Conn, done <-chan stru
 
 func (c *Client) enqueue(msg queuedMessage) error {
 	c.mu.Lock()
+	permanentErr := c.permanentFailure
 	closed := c.closed
 	c.mu.Unlock()
+	if permanentErr != nil {
+		return ErrPermanentFailure
+	}
 	if closed {
 		return ErrClosed
 	}
@@ -731,6 +760,15 @@ func (c *Client) callOnClose() {
 	if c.opts.onClose != nil {
 		c.opts.onClose()
 	}
+}
+
+// PermanentError returns the terminal error that caused the client to stop
+// reconnecting. It returns nil while the client is still active or attempting
+// reconnects.
+func (c *Client) PermanentError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.permanentFailure
 }
 
 // ---------------------------------------------------------------------------
