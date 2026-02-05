@@ -54,6 +54,10 @@ const (
 	DefaultMessageQueueSize         = 100
 	DefaultCloseGracePeriod         = 5 * time.Second
 	DefaultMaxConsecutiveFailures   = 10
+	// DefaultReadLimit is the default maximum message size in bytes (1 MB).
+	// The underlying websocket library defaults to 32 KB which is too small for
+	// crypto exchange streams (e.g., Binance's !ticker@arr can exceed 500 KB).
+	DefaultReadLimit = 1 << 20 // 1 MB
 )
 
 // ErrClosed indicates the client is closed.
@@ -122,6 +126,7 @@ type clientOptions struct {
 	pinger              Pinger
 	maxConsecutiveFails int
 	dialer              func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error)
+	readLimit           int64
 }
 
 // ClientOption is a functional option for configuring the Client.
@@ -204,6 +209,16 @@ func WithDialer(d func(context.Context, string, *websocket.DialOptions) (*websoc
 	return func(o *clientOptions) { o.dialer = d }
 }
 
+// WithReadLimit sets the maximum message size in bytes that can be read from
+// the WebSocket connection. This is passed to conn.SetReadLimit() after
+// establishing the connection.
+// By default, the read limit is set to DefaultReadLimit (1 MB) which is suitable
+// for most crypto exchange streams.
+// A value of -1 disables the read limit entirely.
+func WithReadLimit(n int64) ClientOption {
+	return func(o *clientOptions) { o.readLimit = n }
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions for constructing defaults
 // ---------------------------------------------------------------------------
@@ -254,6 +269,11 @@ func populateDefaults(opts *clientOptions) {
 	}
 	if opts.dialer == nil {
 		opts.dialer = websocket.Dial
+	}
+	// Apply default read limit if not explicitly configured.
+	// A value of 0 means "use default", -1 means "disable limit".
+	if opts.readLimit == 0 {
+		opts.readLimit = DefaultReadLimit
 	}
 }
 
@@ -443,6 +463,11 @@ func (c *Client) connectOnce() error {
 	}
 	if err != nil {
 		return err
+	}
+
+	// Apply read limit if configured (before storing conn so it's ready for use)
+	if c.opts.readLimit != 0 {
+		conn.SetReadLimit(c.opts.readLimit)
 	}
 
 	c.mu.Lock()
